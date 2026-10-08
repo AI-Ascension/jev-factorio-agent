@@ -69,3 +69,63 @@ def test_restore_after_bound_checkpoint_before_prepared_append(tmp_path, monkeyp
         rows = [json.loads(line) for line in archive.path.read_bytes().splitlines()]
         prepared = [r for r in rows if r["transition"] == "attempt_prepared"]
         assert len(prepared) == 1 and prepared[0]["attempt_id"] == original_id
+
+
+@pytest.mark.parametrize("change", [None, "active_id", "active_missing", "active_session", "terminal_set"])
+def test_restore_after_checkpoint_write_before_bound_record(tmp_path, monkeypatch, change):
+    backend = ReceiptBackend("delayed")
+    install_plan(monkeypatch, backend)
+    loop = controller(tmp_path, backend)
+    original_append = AttemptIdentityArchive._append
+
+    def interrupted(archive, transition, *args, **kwargs):
+        if transition == "checkpoint_bound" and kwargs.get("data", {}).get("active_attempts"):
+            raise OSError("controlled failure before checkpoint bound record")
+        return original_append(archive, transition, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AttemptIdentityArchive, "_append", interrupted)
+        with pytest.raises(OSError, match="before checkpoint bound record"):
+            loop.step()
+    assert backend.calls == []
+    path, archive = loop.checkpoint, loop._attempt_identity_archive
+    raw = path.read_bytes()
+    saved = json.loads(raw)
+    original_id = saved["attempt"]["id"]
+    rows = [json.loads(line) for line in archive.path.read_bytes().splitlines()]
+    intent = rows[-1]
+    assert intent["transition"] == "checkpoint_intent"
+    assert intent["data"]["checkpoint_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert intent["data"]["active_attempts"][0]["id"] == original_id
+    if change:
+        if change == "active_id":
+            intent["data"]["active_attempts"][0]["id"] = (
+                "f" * 32 if original_id != "f" * 32 else "e" * 32)
+        elif change == "active_missing":
+            intent["data"]["active_attempts"] = []
+        elif change == "active_session":
+            intent["data"]["active_attempts"][0]["session_id"] = "foreign-session"
+        else:
+            intent["data"]["terminal_outcomes"] = [{"id": "a" * 32, "outcome_sha256": "b" * 64}]
+        canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                             ensure_ascii=False, allow_nan=False).encode()
+        intent["record_sha256"] = hashlib.sha256(canonical({
+            k: v for k, v in intent.items() if k != "record_sha256"})).hexdigest()
+        archive.path.write_bytes(b"".join(canonical(row) + b"\n" for row in rows))
+        journal_before = archive.path.read_bytes()
+        with pytest.raises(AttemptIdentityError):
+            controller(tmp_path, backend, resume=True)
+        assert path.read_bytes() == raw
+        assert archive.path.read_bytes() == journal_before
+        assert backend.calls == []
+    else:
+        restored = controller(tmp_path, backend, resume=True)
+        reconciled = archive.path.read_bytes()
+        controller(tmp_path, backend, resume=True)
+        assert archive.path.read_bytes() == reconciled and path.read_bytes() == raw
+        restored.step()
+        assert restored.memory.attempt["id"] == original_id
+        assert restored.memory.pending is not None and backend.calls == []
+        prepared = [json.loads(line) for line in archive.path.read_bytes().splitlines()
+                    if json.loads(line)["transition"] == "attempt_prepared"]
+        assert len(prepared) == 1 and prepared[0]["attempt_id"] == original_id

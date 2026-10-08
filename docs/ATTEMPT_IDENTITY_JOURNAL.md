@@ -39,6 +39,10 @@ complete resulting ownership before appending the missing metadata. It retains
 the original ID and leaves checkpoint bytes intact. It does not fabricate a
 dispatch witness. Changed checkpoint bytes or foreign session/target journal
 records fail closed. Repeated restore does not duplicate preparation records.
+For the intended new checkpoint, restore compares the entire active tuple set
+and terminal outcome bindings and validates projected ownership before appending
+any recovery record. An inconsistent intent cannot alter the journal during
+rejection. The same checks apply to an interrupted bound-record publication.
 
 A terminal result is journaled before the checkpoint releases an attempt.
 Settlement retains the first result and original identity. Background craft

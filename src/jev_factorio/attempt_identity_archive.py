@@ -888,15 +888,15 @@ class AttemptIdentityArchive:
                          "terminal_outcomes"}:
             raise AttemptIdentityError("Checkpoint write intent is malformed")
         if current_sha == data["checkpoint_sha256"]:
+            missing = self._validate_binding_capture(memory, data)
             self._append("checkpoint_bound", memory, data={
                 "checkpoint_sha256": current_sha,
                 "active_attempts": data["active_attempts"],
                 "terminal_outcomes": data["terminal_outcomes"],
             })
-            for identity in data["active_attempts"]:
-                if not self._has_transition("attempt_prepared", identity["id"]):
-                    self._append("attempt_prepared", memory, identity=identity,
-                                 data={"checkpoint_sha256": current_sha})
+            for identity in missing:
+                self._append("attempt_prepared", memory, identity=identity,
+                             data={"checkpoint_sha256": current_sha})
             self._settle_from_checkpoint(memory, current_sha)
         elif current_sha == data["previous_sha256"]:
             self._append("checkpoint_write_abandoned", memory, data={
@@ -921,12 +921,22 @@ class AttemptIdentityArchive:
                         if row["transition"] == "checkpoint_bound"), None)
         if binding is None:
             return  # Explicit legacy anchors retain their separate authority.
-        if (binding["data"]["checkpoint_sha256"] != current_sha
-                or binding["data"]["active_attempts"] != self._active_identities(memory)):
+        if binding["data"]["checkpoint_sha256"] != current_sha:
             raise AttemptIdentityError("Checkpoint differs from its exact bound attempt set")
+        missing = self._validate_binding_capture(memory, binding["data"])
+        for identity in missing:
+            self._append("attempt_prepared", memory, identity=identity,
+                         data={"checkpoint_sha256": current_sha})
+        self._settle_from_checkpoint(memory, current_sha)
+
+    def _validate_binding_capture(self, memory, data: dict) -> list[dict]:
+        """Validate every projected obligation before publishing recovery rows."""
+        if (data["active_attempts"] != self._active_identities(memory)
+                or data["terminal_outcomes"] != self._terminal_rows(memory)):
+            raise AttemptIdentityError("Checkpoint differs from its complete intent or bound metadata")
         attempts, _ = self._transition_state()
         missing = []
-        for identity in binding["data"]["active_attempts"]:
+        for identity in data["active_attempts"]:
             state = attempts.get(identity["id"])
             if state is None:
                 missing.append(identity)
@@ -935,10 +945,7 @@ class AttemptIdentityArchive:
         # Validate the complete resulting ownership before appending anything;
         # an unrelated missing/changed outcome must not gain metadata authority.
         self._validate_memory(memory, recovered_prepared=missing)
-        for identity in missing:
-            self._append("attempt_prepared", memory, identity=identity,
-                         data={"checkpoint_sha256": current_sha})
-        self._settle_from_checkpoint(memory, current_sha)
+        return missing
 
     def _validate_memory(self, memory, *, recovered_prepared=()) -> None:
         attempts, baseline = self._transition_state()
