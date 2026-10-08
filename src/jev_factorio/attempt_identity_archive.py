@@ -344,6 +344,9 @@ class AttemptIdentityArchive:
                 except (UnicodeError, ValueError, json.JSONDecodeError) as error:
                     raise AttemptIdentityError("Attempt identity journal is malformed") from error
                 self._validate_record(item, index, previous)
+                if records and (item["session_id"], item["target"]) != (
+                        records[0]["session_id"], records[0]["target"]):
+                    raise AttemptIdentityError("Attempt journal record belongs to another campaign")
                 previous = item["record_sha256"]
                 records.append(item)
                 if len(records) > MAX_ATTEMPT_JOURNAL_RECORDS:
@@ -714,6 +717,7 @@ class AttemptIdentityArchive:
         if (self._identity != (memory.session_id, memory.target)
                 or current_sha != self._checkpoint_sha256):
             raise AttemptIdentityError("Checkpoint does not match its durable attempt journal")
+        self._reconcile_bound_checkpoint(memory, current_sha)
         self._validate_memory(memory)
         if self._read_file(self.checkpoint, maximum=64 * 1024 * 1024) != raw:
             raise AttemptIdentityError("Checkpoint changed during attempt identity restore")
@@ -865,8 +869,45 @@ class AttemptIdentityArchive:
         return any(row["transition"] == transition and row["attempt_id"] == attempt_id
                    for row in self._records)
 
-    def _validate_memory(self, memory) -> None:
+    def _reconcile_bound_checkpoint(self, memory, current_sha: str) -> None:
+        """Finish interrupted metadata publication from an exact durable binding.
+
+        The checkpoint-bound record already commits the immutable active tuple
+        set. This repairs a crash before its prepared/settled records, never a
+        missing dispatch witness and never an unbound or changed checkpoint.
+        """
+        binding = next((row for row in reversed(self._records)
+                        if row["transition"] == "checkpoint_bound"), None)
+        if binding is None:
+            return  # Explicit legacy anchors retain their separate authority.
+        if (binding["data"]["checkpoint_sha256"] != current_sha
+                or binding["data"]["active_attempts"] != self._active_identities(memory)):
+            raise AttemptIdentityError("Checkpoint differs from its exact bound attempt set")
+        attempts, _ = self._transition_state()
+        missing = []
+        for identity in binding["data"]["active_attempts"]:
+            state = attempts.get(identity["id"])
+            if state is None:
+                missing.append(identity)
+            elif state["identity"] != identity or not state["prepared"]:
+                raise AttemptIdentityError("Bound attempt has inconsistent durable preparation")
+        # Validate the complete resulting ownership before appending anything;
+        # an unrelated missing/changed outcome must not gain metadata authority.
+        self._validate_memory(memory, recovered_prepared=missing)
+        for identity in missing:
+            self._append("attempt_prepared", memory, identity=identity,
+                         data={"checkpoint_sha256": current_sha})
+        self._settle_from_checkpoint(memory, current_sha)
+
+    def _validate_memory(self, memory, *, recovered_prepared=()) -> None:
         attempts, baseline = self._transition_state()
+        for identity in recovered_prepared:
+            if identity["id"] in attempts:
+                raise AttemptIdentityError("Recovered attempt already has durable transitions")
+            attempts[identity["id"]] = {
+                "identity": identity, "prepared": True,
+                "terminal": None, "settled": False,
+            }
         baseline_by_id = {row["id"]: row["sha256"] for row in baseline}
         outcomes_by_id = {row["id"]: row for row in memory.attempt_outcomes}
         for row in memory.attempt_outcomes:
