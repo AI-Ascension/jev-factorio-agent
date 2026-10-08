@@ -43,6 +43,29 @@ _OWNER_LOCKS: dict[str, dict] = {}
 _OWNER_LOCAL = threading.local()
 
 
+def _owner_fork_child() -> None:
+    """Drop inherited process authority without unlocking the parent's flock."""
+    global _REGISTRY_GUARD, _OWNER_LOCAL
+    for slot in _OWNER_LOCKS.values():
+        descriptor = slot.get("descriptor")
+        if descriptor is not None:
+            try:
+                # Never LOCK_UN here: the inherited open-file description is
+                # shared with the still-owning parent process.
+                os.close(descriptor)
+            except OSError:
+                pass
+    _OWNER_LOCKS.clear()
+    _REGISTRY_GUARD = threading.Lock()
+    _OWNER_LOCAL = threading.local()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=lambda: _REGISTRY_GUARD.acquire(),
+                        after_in_parent=lambda: _REGISTRY_GUARD.release(),
+                        after_in_child=_owner_fork_child)
+
+
 def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -141,6 +164,7 @@ def _open_regular(path: Path, flags: int, mode: int = 0o600) -> int:
 
 @contextmanager
 def _owner_guard(lock_path: Path) -> Iterator[None]:
+    owner_pid = os.getpid()
     key = os.path.normcase(os.path.abspath(os.fspath(lock_path)))
     held = getattr(_OWNER_LOCAL, "held", None)
     if held is None:
@@ -175,7 +199,11 @@ def _owner_guard(lock_path: Path) -> Iterator[None]:
     locked = False
     try:
         flags = os.O_RDWR | os.O_CREAT
-        descriptor = _open_regular(lock_path, flags, 0o600)
+        # Register every thread's descriptor under the fork barrier. A child
+        # must close inherited descriptors even when their owner thread vanishes.
+        with _REGISTRY_GUARD:
+            descriptor = _open_regular(lock_path, flags, 0o600)
+            slot["descriptor"] = descriptor
         if os.name == "posix":
             import fcntl
             try:
@@ -195,9 +223,13 @@ def _owner_guard(lock_path: Path) -> Iterator[None]:
                 raise AttemptIdentityBusy("Another process owns this checkpoint") from error
             locked = True
         held[key] = {"depth": 1, "descriptor": descriptor,
-                     "slot": slot, "path": lock_path}
+                     "slot": slot, "path": lock_path, "pid": os.getpid()}
         yield
     except BaseException as original_error:
+        if os.getpid() != owner_pid:
+            # The child fork hook already closed inherited descriptors. This
+            # suspended parent context has no authority to unlock or close them.
+            raise
         # Discard reentrant authority before releasing its real OS lock.
         held.pop(key, None)
         cleanup_error = None
@@ -213,7 +245,9 @@ def _owner_guard(lock_path: Path) -> Iterator[None]:
                             os.lseek(descriptor, 0, os.SEEK_SET)
                             msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
                 finally:
-                    os.close(descriptor)
+                    with _REGISTRY_GUARD:
+                        slot.pop("descriptor", None)
+                        os.close(descriptor)
         except BaseException as error:
             cleanup_error = error
         finally:
@@ -226,6 +260,8 @@ def _owner_guard(lock_path: Path) -> Iterator[None]:
             raise original_error from cleanup_error
         raise
     else:
+        if os.getpid() != owner_pid:
+            return
         item = held.pop(key)
         descriptor = item["descriptor"]
         unlock_error = None
@@ -241,7 +277,9 @@ def _owner_guard(lock_path: Path) -> Iterator[None]:
             unlock_error = error
         finally:
             try:
-                os.close(descriptor)
+                with _REGISTRY_GUARD:
+                    slot.pop("descriptor", None)
+                    os.close(descriptor)
             finally:
                 local_lock.release()
                 with _REGISTRY_GUARD:
@@ -268,15 +306,17 @@ class AttemptIdentityArchive:
         self._checkpoint_sha256: str | None = None
         self._identity: tuple[str, str] | None = None
         self._loaded = False
+        self._loaded_pid = os.getpid()
 
     @contextmanager
     def owner(self):
         _ensure_private_directory(self.directory)
         with _owner_guard(self.lock_path):
-            was_loaded = self._loaded
+            was_loaded = self._loaded and self._loaded_pid == os.getpid()
             if not was_loaded:
                 self._load()
                 self._loaded = True
+                self._loaded_pid = os.getpid()
             try:
                 yield self
             finally:
@@ -284,7 +324,8 @@ class AttemptIdentityArchive:
 
     def _require_owner(self) -> None:
         key = os.path.normcase(os.path.abspath(os.fspath(self.lock_path)))
-        if key not in getattr(_OWNER_LOCAL, "held", {}):
+        held = getattr(_OWNER_LOCAL, "held", {}).get(key)
+        if held is None or held["pid"] != os.getpid():
             raise AttemptIdentityError("Attempt journal operation requires checkpoint ownership")
 
     def _read_file(self, path: Path, *, maximum: int) -> bytes:

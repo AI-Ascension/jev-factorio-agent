@@ -17,6 +17,11 @@ observation, dispatch and checkpoint settlement. Nested background observations
 retain the outer owner and loaded journal. Exceptions remove reentrant authority
 and release the local registry even if OS cleanup fails. An original journal or
 checkpoint failure remains the primary exception, with cleanup failures chained.
+On POSIX fork, the child drops copied thread ownership and closes its inherited
+lock descriptors without unlocking the parent's shared file descriptions. It
+must acquire a new OS lock and reload the journal before operating. Unwinding
+a copied parent context cannot release the parent's lock. A fork does not
+transfer controller or native campaign authority to the child.
 
 Before saving, the owner appends a durable checkpoint intent containing the
 expected checkpoint digest and complete active attempt tuples. After the atomic
@@ -58,7 +63,9 @@ identity boundary, not an independently controlled cryptographic trust anchor.
 
 The focused tests use real local locks and explicitly synthetic backends.
 Prepared-binding crash controls and public step/resume controls are offline
-evidence. The complete CLI/shared-connector, legacy, fsync/crash, independent
-process, Windows and async lineage matrices still require qualification against
-the final candidate. Native campaign acceptance requires the existing owner,
+evidence. Retained legacy shared-connector composition has explicit one-use
+approval and selected CLI preflight controls. Real POSIX fork and fresh-process
+controls cover exclusion, reacquisition/reload and copied-context unwinding.
+Complete top-level CLI, legacy, fsync/crash, Windows and async lineage matrices
+still require qualification against the final candidate. Native campaign acceptance requires the existing owner,
 reviewed deployed source, retained save/receipts and actual timing authority.
