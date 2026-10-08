@@ -10,6 +10,7 @@ from jev_factorio.skills import Plan, Step
 from jev_factorio.telemetry import make_attempt
 from jev_factorio.compatible_recovery import scope as compatible_recovery_scope
 from jev_factorio.memory import load_checkpoint
+from jev_factorio.attempt_identity_archive import AttemptIdentityError
 from test_background_work import ReceiptBackend, controller
 
 
@@ -224,11 +225,18 @@ def test_invalid_persisted_wait_rollover_witness_fails_closed(tmp_path, corrupti
     with pytest.raises(ValueError, match="rollover witness"):
         load_checkpoint(Path(loop.checkpoint), backend.state.session_id, loop.target)
 
-    result = loop.step()
-
-    assert "observation budget" in result["outcome"]
-    assert loop.memory.pending is None
-    assert loop.memory.active_plan is None
+    before_checkpoint = Path(loop.checkpoint).read_bytes()
+    before_journal = loop._attempt_identity_archive.path.read_bytes()
+    before_observations = backend.observations
+    before_calls = deepcopy(backend.calls)
+    with pytest.raises(AttemptIdentityError, match="rollover witness"):
+        loop.step()
+    assert Path(loop.checkpoint).read_bytes() == before_checkpoint
+    assert loop._attempt_identity_archive.path.read_bytes() == before_journal
+    assert backend.observations == before_observations
+    assert backend.calls == before_calls
+    assert loop.memory.pending is not None
+    assert loop.memory.active_plan is not None
     assert loop.memory.background_job is not None
     assert [action for action, _ in backend.calls].count("factory_craft_job") == 1
 
@@ -262,10 +270,17 @@ def test_unrelated_wait_does_not_inherit_background_poll_rollover(tmp_path):
     )
     loop._save()
 
-    result = loop.step()
-
-    assert result["status"] == "running"
-    assert loop.memory.pending is None
-    assert loop.memory.failures.get(plan.id) == 1
+    before_checkpoint = Path(loop.checkpoint).read_bytes()
+    before_journal = loop._attempt_identity_archive.path.read_bytes()
+    before_observations = backend.observations
+    before_calls = deepcopy(backend.calls)
+    with pytest.raises(AttemptIdentityError, match="durable ownership"):
+        loop.step()
+    assert Path(loop.checkpoint).read_bytes() == before_checkpoint
+    assert loop._attempt_identity_archive.path.read_bytes() == before_journal
+    assert backend.observations == before_observations
+    assert backend.calls == before_calls
+    assert loop.memory.pending is not None
+    assert loop.memory.failures.get(plan.id, 0) == 0
     assert loop.memory.background_job is not None
     assert [action for action, _ in backend.calls].count("factory_craft_job") == 1

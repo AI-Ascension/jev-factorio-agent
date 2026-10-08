@@ -21,6 +21,7 @@ from jev_factorio.outpost_controller import outpost_loop_type
 from jev_factorio.successor_controller import successor_loop_type
 from jev_factorio.supervisor import atomic_json
 from test_supervisor import operational_result
+from attempt_identity_helpers449 import repair_candidate_write
 
 
 MIGRATIONS = {
@@ -81,7 +82,7 @@ def _assert_current_loaders_accept(previous, current, memory_type):
 
 
 def _set_candidate(supervisor, tmp_path, previous, current):
-    atomic_json(supervisor.config.checkpoint, current)
+    repair_candidate_write(supervisor, previous, current)
     before = supervisor.config.checkpoint.read_bytes()
     result = operational_result(supervisor, tmp_path)
     # The shared test fixture deliberately pins source_identity so this suite

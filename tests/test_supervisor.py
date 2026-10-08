@@ -8,6 +8,7 @@ from jev_factorio.supervisor import Supervisor, SupervisorConfig, atomic_json
 from jev_factorio.memory import CampaignMemory
 from jev_factorio.skills import Plan, Step
 from jev_factorio.telemetry import make_attempt
+from attempt_identity_helpers449 import repair_candidate_write
 
 
 class FakeClock:
@@ -763,7 +764,7 @@ def test_repair_accepts_loader_recorded_empty_output_legacy_migration(
         "kind": "output_ownership_enabled", "tick": 1,
         "reason": "explicit_empty_ownership_at_idle_boundary",
     }
-    atomic_json(supervisor.config.checkpoint, current)
+    repair_candidate_write(supervisor, previous, current)
     result = operational_result(supervisor, tmp_path)
     monkeypatch.setattr(supervisor, "source_identity", lambda: ("head", "diff"))
 
@@ -850,7 +851,7 @@ def test_repair_accepts_only_loader_recorded_idle_capability_migrations(
     memory_type.from_bytes(json.dumps(current).encode(), "fresh", "rocket_launch")
     assert current["history"][:len(previous["history"])] == previous["history"]
     assert any(row.get("kind") == expected_event for row in current["history"])
-    atomic_json(supervisor.config.checkpoint, current)
+    repair_candidate_write(supervisor, previous, current)
     result = operational_result(supervisor, tmp_path)
     monkeypatch.setattr(supervisor, "source_identity", lambda: ("head", "diff"))
 
@@ -1006,7 +1007,9 @@ def test_rejected_repair_cannot_replace_baseline_on_retry_or_restart(supervisor,
     atomic_json(supervisor.config.checkpoint, changed)
     monkeypatch.setattr(supervisor, "source_identity", lambda: ("evil-head", "changed"))
     supervisor.begin_repair("retry")
-    supervisor.initialize()
+    before_rejected = supervisor.config.checkpoint.read_bytes()
+    assert supervisor.run() == 2
+    assert supervisor.config.checkpoint.read_bytes() == before_rejected
     assert supervisor.state["repair_required"] is True
     assert supervisor.state["incident"]["checkpoint"] == initial
     assert tuple(supervisor.state["incident"]["source"]) == ("head", "diff")
