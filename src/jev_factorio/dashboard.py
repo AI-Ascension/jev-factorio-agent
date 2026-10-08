@@ -44,7 +44,7 @@ RECORD_KEYS = ("controller", "policy", "tick", "session_id", "world_kind", "goal
                "decision", "model_call", "requested_model", "resolved_model", "usage", "pending",
                "persistent_recovery", "code_revision", "process_id", "run_id", "segment_id",
                "execution_id")
-STATE_KEYS = ("tick", "session_id", "world_kind", "inventory", "player_position", "nearby_resources",
+STATE_KEYS = ("tick", "session_id", "world_kind", "game_version", "inventory", "player_position", "nearby_resources",
               "placed_entities", "drill_status", "drill_fuel", "drill_output_connected",
               "iron_ore_collected", "production_rates", "researched", "victory", "victory_source")
 MISSION_GATE_KEYS = ("contract", "pad", "payload", "rocket", "cargo", "request", "victory")
@@ -66,6 +66,12 @@ def sanitize(value: Any, secrets: tuple[str, ...] = ()) -> Any:
     """Detach JSON data with a total node/depth budget and visible omissions."""
     remaining = [3000]
 
+    def text(item: str) -> str:
+        for secret in secrets:
+            item = item.replace(secret, "[redacted]")
+        item = CREDENTIAL.sub("[redacted]", URL.sub("[URL redacted]", item))
+        return item[:2000] + (" [truncated]" if len(item) > 2000 else "")
+
     def visit(item: Any, depth: int = 0) -> Any:
         remaining[0] -= 1
         if remaining[0] < 0 or depth > 12:
@@ -75,10 +81,7 @@ def sanitize(value: Any, secrets: tuple[str, ...] = ()) -> Any:
         if isinstance(item, float):
             return item if math.isfinite(item) else None
         if isinstance(item, str):
-            for secret in secrets:
-                item = item.replace(secret, "[redacted]")
-            item = CREDENTIAL.sub("[redacted]", URL.sub("[URL redacted]", item))
-            return item[:2000] + (" [truncated]" if len(item) > 2000 else "")
+            return text(item)
         if isinstance(item, dict):
             result = {}
             for index, (key, child) in enumerate(item.items()):
@@ -88,7 +91,15 @@ def sanitize(value: Any, secrets: tuple[str, ...] = ()) -> Any:
                 if not isinstance(key, str):
                     continue
                 clean_key = visit(key, depth + 1)
-                result[clean_key] = "[redacted]" if SECRET_KEY.search(key) else visit(child, depth + 1)
+                if SECRET_KEY.search(key):
+                    result[clean_key] = "[redacted]"
+                elif key == "researched" and has_coherent_research_observation(item):
+                    # Tick-bound research is semantic evidence with its own
+                    # MAX_TECHNOLOGIES bound, not a generic 128-row display list.
+                    # Redaction and the enclosing event byte limit still apply.
+                    result[clean_key] = [text(name) for name in child]
+                else:
+                    result[clean_key] = visit(child, depth + 1)
             return result
         if isinstance(item, (list, tuple)):
             result = [visit(child, depth + 1) for child in item[:128] if remaining[0] >= 0]
@@ -1100,15 +1111,28 @@ class Monitor:
             current, progress = self.research_state["current"], self.research_state["progress"]
         if researched is None:
             return {"status": "no research state", "version": tree.version}, None
+        observed_version = state.get("game_version")
+        if observed_version is not None and observed_version != tree.version:
+            return {"status": "version mismatch", "version": tree.version,
+                    "observed_version": observed_version}, None
         unknown = [t for t in researched if t not in tree.catalog["technologies"]]
         if unknown:
             # Telemetry from another game version or mod set: never mix trees.
             return {"status": "version mismatch", "version": tree.version, "unknown": unknown[:5]}, None
         summary = tree.summary(set(researched), current if isinstance(current, str) else None,
-                               progress if type(progress) in (int, float) else None, self.research_seen or {})
+                               progress if type(progress) in (int, float) else None, self.research_seen or {},
+                               # A catalog can suggest a trigger only for an identified,
+                               # coherent live observation. Legacy names alone cannot
+                               # establish either the active version or an empty queue.
+                               allow_trigger=(not self._research_observation_incomplete
+                                              and (source == "catalog" or (
+                                                  observed_version == tree.version
+                                                  and has_coherent_mission_projection(state)))))
         milestones = summary.pop("milestones")
         status = "observation incomplete" if self._research_observation_incomplete else "ok"
-        return dict(summary, status=status, source=source), milestones
+        return dict(summary, status=status, source=source,
+                    version_identity=("catalog-only" if source == "catalog" else
+                                      "matched" if observed_version == tree.version else "unknown")), milestones
 
     def _read_supervisor(self) -> None:
         if self.supervisor is None:

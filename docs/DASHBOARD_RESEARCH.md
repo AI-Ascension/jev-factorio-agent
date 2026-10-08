@@ -38,8 +38,8 @@ versions. It exports the tree plus the agent force's research state as
 
 It reaches the dashboard as a sidecar file, `research-catalog.json`:
 
-- **This controller (FLE backend):** written next to `--log-file` (or
-  `--dashboard-events`) at startup. It is best effort: a failure prints a warning
+- **This controller (FLE backend):** written next to `--dashboard-events` when enabled, otherwise
+  next to `--log-file`, at startup. It is best effort: a failure prints a warning
   and never affects the run.
 - **Any other FLE or RCON setup, including 1.1.110:** run the exporter yourself.
   `--watch` keeps the research state fresh when no controller telemetry carries
@@ -54,8 +54,26 @@ The dashboard looks for `research-catalog.json` next to its telemetry file
 (override with `--research-catalog`) and reloads it when it changes.
 Controller telemetry (`researched`, and the factory's current research) is
 preferred over the sidecar's own state. If telemetry names a technology the tree
-doesn't have, the strip is hidden ("version mismatch") and the fixed milestone
-list is shown instead. Trees from different versions are never mixed.
+doesn't have, or supplies a game version different from the catalog, the strip
+is hidden ("version mismatch") and the fixed milestone list is shown instead.
+Legacy telemetry without a game version retains its name-based summary with
+`version_identity: unknown`; matching telemetry reports `matched`, while the
+sidecar's own state reports `catalog-only`. This is display provenance, not
+native compatibility or deployment acceptance.
+
+When no ordinary topic is current, an eligible trigger on the goal path is
+shown with unknown progress. For telemetry, this requires a matching game
+version and a mission projection bound to the current tick and session; the
+sidecar's own state can also supply it. Incomplete observations and legacy
+unknown-version telemetry cannot revive a trigger from the catalog. Ordinary
+research takes precedence. Formula-based costs alone do not make a technology
+infinite: its exported maximum level determines that.
+
+Tick-bound research sets retain up to 5,000 valid names through event writing
+and polling, with credential redaction and the event byte limit still enforced.
+Malformed science-pack tables make the sidecar invalid; polling continues and
+a valid replacement can recover it. Missing or null legacy pack tables remain
+supported. Watch intervals must be finite and at least two seconds.
 
 ## Icons
 

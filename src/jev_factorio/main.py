@@ -1292,7 +1292,7 @@ def cli() -> None:
                 loop._safety.outputs = (*loop._safety.outputs, Path(args.dashboard_events).parent)
         if args.backend == "fle" and (args.log_file or args.dashboard_events):
             from .research_catalog import export_sidecar
-            export_sidecar(getattr(loop, "backend", None), Path(args.log_file or args.dashboard_events).parent)
+            export_sidecar(getattr(loop, "backend", None), Path(args.dashboard_events or args.log_file).parent)
         if setup_timing:
             setup_timing.mark('outputs_ready')
         if setup_timing:
