@@ -43,6 +43,15 @@ For the intended new checkpoint, restore compares the entire active tuple set
 and terminal outcome bindings and validates projected ownership before appending
 any recovery record. An inconsistent intent cannot alter the journal during
 rejection. The same checks apply to an interrupted bound-record publication.
+Before abandoning an interrupted write against the old checkpoint, restore
+checks the earlier durable digest and complete original ownership. A replacement
+UUID cannot gain a journal record merely by rehashing the intent's old digest.
+Every intended new checkpoint requires a complete SHA256 digest; only the old
+digest may be null for a newly anchored campaign.
+Terminal crash controls preserve the first result across an interrupted
+checkpoint write, bound-record append or settlement append. The legitimate
+old-checkpoint recovery finishes the original attempt without another dispatch;
+repeated restore does not duplicate terminal or settlement rows.
 
 A terminal result is journaled before the checkpoint releases an attempt.
 Settlement retains the first result and original identity. Background craft

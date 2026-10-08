@@ -511,8 +511,9 @@ class AttemptIdentityArchive:
                     raise AttemptIdentityError("Checkpoint write intent fields are invalid")
                 for name in ("previous_sha256", "checkpoint_sha256"):
                     value = data[name]
-                    if value is not None and (type(value) is not str
-                            or re.fullmatch(r"[0-9a-f]{64}", value) is None):
+                    if (value is None and name == "checkpoint_sha256"
+                            or value is not None and (type(value) is not str
+                            or re.fullmatch(r"[0-9a-f]{64}", value) is None)):
                         raise AttemptIdentityError("Checkpoint write intent digest is invalid")
                 if type(data["active_attempts"]) is not list or len(data["active_attempts"]) > 2:
                     raise AttemptIdentityError("Checkpoint active attempt set is invalid")
@@ -899,6 +900,13 @@ class AttemptIdentityArchive:
                              data={"checkpoint_sha256": current_sha})
             self._settle_from_checkpoint(memory, current_sha)
         elif current_sha == data["previous_sha256"]:
+            # An interrupted intent cannot replace the earlier durable binding.
+            # Validate that old checkpoint and its complete ownership before
+            # recording abandonment; rejection must leave the journal intact.
+            if (self._identity != (memory.session_id, memory.target)
+                    or current_sha != self._checkpoint_sha256):
+                raise AttemptIdentityError("Old checkpoint differs from its durable attempt binding")
+            self._validate_memory(memory)
             self._append("checkpoint_write_abandoned", memory, data={
                 "previous_sha256": current_sha,
                 "expected_sha256": data["checkpoint_sha256"],
