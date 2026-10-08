@@ -1,0 +1,217 @@
+"""Single campaign service owner. Never replay initialization or reset a world."""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+from uuid import uuid4
+
+ROOT = Path('/home/ubuntu/jev-continuous-20261004')
+RUN = ROOT / 'run'
+SOURCE = ROOT / 'source-production-v46-20261004'
+CHECKPOINT = RUN / 'controller.json'
+SCRIPT_SHA = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+stop = False
+child = None
+
+
+def write(path, value, *, exclusive=False):
+    encoded = (json.dumps(value, sort_keys=True) + '\n').encode()
+    target = path if exclusive else path.with_name(path.name + '.tmp')
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_EXCL if exclusive else os.O_TRUNC)
+    fd = os.open(target, flags, 0o600)
+    with os.fdopen(fd, 'wb') as out:
+        out.write(encoded); out.flush(); os.fsync(out.fileno())
+    if not exclusive:
+        os.replace(target, path)
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def status(phase, **values):
+    write(RUN / 'owner-status.json', {'at': time.time(), 'phase': phase,
+          'owner_pid': os.getpid(), 'script_sha256': SCRIPT_SHA, **values})
+
+
+def on_stop(signum, frame):
+    global stop
+    stop = True
+    if child is not None and child.poll() is None:
+        child.send_signal(signal.SIGINT)
+
+
+def probe():
+    from factorio_rcon import RCONClient
+    c = RCONClient('127.0.0.1', 27015, os.environ['FACTORIO_RCON_PASSWORD'], timeout=10)
+    try:
+        return json.loads(c.send_command('/sc local rt=jev_fle_runtime; local connected=0; '
+            'for _,p in pairs(game.players) do if p.connected then connected=connected+1 end end; '
+            'rcon.print(helpers.table_to_json({tick=game.tick,speed=game.speed,'
+            'marked=storage.jev_factorio_session==true,runtime=rt~=nil,'
+            'session_id=rt and rt.jev_session_id or false,connected=connected}))'))
+    finally:
+        c.close()
+
+
+def hold(reason):
+    while not stop:
+        status('held', reason=reason, automatic_retry_allowed=False)
+        time.sleep(5)
+
+
+def useful_event(event):
+    return (event.get('kind') == 'step_verified' and bool(event.get('action'))
+            and event['action'] not in ('factory_wait', 'idle', 'observe', 'verify'))
+
+
+def main():
+    global child
+    lock = (RUN / 'single-writer.lock').open('a+')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    signal.signal(signal.SIGTERM, on_stop); signal.signal(signal.SIGINT, on_stop)
+    config = json.loads((ROOT / 'controller-config.json').read_text())
+    os.environ.update(json.loads((ROOT / 'provider-private.json').read_text()))
+    os.environ.update(FACTORIO_RCON_HOST='127.0.0.1', FACTORIO_RCON_PORT='27015',
+        FACTORIO_RCON_PASSWORD=(ROOT / 'server/rcon-password').read_text().strip(),
+        PYTHONPATH=str(SOURCE / 'src'), PYTHONUNBUFFERED='1')
+    sys.path.insert(0, str(SOURCE / 'src'))
+    from jev_factorio.provenance import source_revision
+    revision = source_revision(SOURCE)
+    if config.get('owner_sha256') != SCRIPT_SHA:
+        hold('Signed owner differs from admitted configuration'); return
+    authority_path = ROOT / 'recovery-v46.json'
+    authority_raw = authority_path.read_bytes()
+    if hashlib.sha256(authority_raw).hexdigest() != config.get('recovery_sha256'):
+        hold('Recovery authority differs from admitted pin'); return
+    authority = json.loads(authority_raw)
+    if authority.get('new_source_revision') != revision:
+        hold('Recovery source differs from reviewed revision'); return
+    if revision != config['source_revision']:
+        hold('Deployed source differs from admitted revision'); return
+    base = [sys.executable, '-m', 'jev_factorio', '--backend', 'fle', '--controller', 'hierarchical',
+        '--policy', 'jev', '--two-stage-decisions', '--model', 'jev-1.13.0', '--target', 'rocket_launch',
+        '--factory-scheduling', 'ready-work', '--background-work', '--furnace-output-buffers',
+        '--furnace-input-belts', '--mining-outposts', '--campaign-diagnostics',
+        '--profile-observations', '--consolidated-observations', '--tick-seconds', '0.1',
+        '--checkpoint', str(CHECKPOINT), '--log-file', str(RUN / 'gameplay.jsonl'),
+        '--dashboard-events', str(RUN / 'dashboard.jsonl')]
+    attempts = len(list(RUN.glob('*-prepared.json')))
+    while not stop:
+        try:
+            native = probe()
+        except Exception as error:
+            status('waiting_for_game', error_type=type(error).__name__)
+            time.sleep(10); continue
+        if not native['marked'] or native['speed'] != 1:
+            hold('Dedicated world marker or real-time speed mismatch'); return
+        if native['connected'] != 1:
+            status('waiting_for_player', connected=native['connected']); time.sleep(5); continue
+        fresh = not CHECKPOINT.exists()
+        if fresh:
+            hold('Recovery owner requires the existing campaign checkpoint'); return
+        recovering = not (RUN / 'recovery-v46-consumed.json').exists()
+        if recovering and hashlib.sha256(CHECKPOINT.read_bytes()).hexdigest() != authority['checkpoint_sha256']:
+            hold('Checkpoint changed after maintenance admission'); return
+        if recovering and json.loads(CHECKPOINT.read_text())['blocked_recovery']['source_revision'] != authority['blocked_source_revision']:
+            hold('Blocked decision source differs from recovery authority'); return
+        initial_intent = RUN / 'owner-initialization.json'
+        if fresh:
+            if initial_intent.exists() or native['runtime']:
+                hold('Partial initialization needs reconciliation; no automatic reset'); return
+        else:
+            memory = json.loads(CHECKPOINT.read_text())
+            if memory['status'] == 'completed':
+                status('completed', session_id=memory['session_id']); return
+            if not native['runtime'] or native['session_id'] != memory['session_id']:
+                hold('World restarted or session changed; native runtime reconciliation required'); return
+            if native['tick'] < memory.get('last_tick', 0):
+                hold('Saved world predates controller checkpoint'); return
+            if recovering and (memory['session_id'] != authority['session_id']
+                    or memory['status'] != 'blocked'
+                    or memory['reason'] not in ('Candidate evidence insufficient', 'low choice confidence')
+                    or any(memory.get(key) is not None for key in ('pending', 'attempt', 'background_job', 'background_attempt', 'background_step'))):
+                hold('Blocked recovery is not at its admitted idle boundary'); return
+            if memory['status'] in ('blocked', 'uncertain') and not recovering:
+                hold('Controller exited at a policy or native reconciliation boundary'); return
+        if attempts >= 46:
+            hold('Repeated controller exit requires diagnosis'); return
+        if source_revision(SOURCE) != revision:
+            hold('Source changed during campaign'); return
+        execution = uuid4().hex
+        context = {'run_id': 'jev-continuous-20261004', 'segment_id': 'frozen-source',
+                   'execution_id': execution, 'code_revision': revision}
+        os.environ['JEV_FACTORIO_PROVENANCE'] = json.dumps(context)
+        args = base + ['--run-dir', str(RUN / ('research-' + execution)), '--until-complete',
+                       '--persist-recoverable-blocks', '--persistent-idle-observations', '0']
+        if fresh:
+            args += ['--initialize-persistent-campaign']
+            write(initial_intent, {'at': time.time(), 'source_revision': revision,
+                  'script_sha256': SCRIPT_SHA, 'native_before': native}, exclusive=True)
+        else:
+            # The existing CLI performs source/checkpoint/native attachment and
+            # pending receipt reconciliation. No native state is rewritten here.
+            args += ['--resume', '--resume-controller']
+        if recovering:
+            args += ['--reevaluate-blocked-once', '--exact-checkpoint-sha256', authority['checkpoint_sha256'],
+                     '--blocked-source-revision', authority['blocked_source_revision']['commit']]
+        prepared = RUN / (execution + '-prepared.json')
+        write(prepared, {'at': time.time(), 'argv': args, 'script_sha256': SCRIPT_SHA,
+                         'provenance': context, 'native_before': native}, exclusive=True)
+        if recovering:
+            write(RUN / 'recovery-v46-consumed.json', {'at': time.time(), 'execution_id': execution,
+                  'authority_sha256': config['recovery_sha256'], 'script_sha256': SCRIPT_SHA,
+                  'prepared_sha256': hashlib.sha256(prepared.read_bytes()).hexdigest()}, exclusive=True)
+        with (RUN / (execution + '-console.log')).open('xb') as output:
+            child = subprocess.Popen(args, cwd=SOURCE, stdout=output, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL, pass_fds=(lock.fileno(),))
+            attempts += 1
+            write(RUN / (execution + '-launched.json'), {'pid': child.pid,
+                  'script_sha256': SCRIPT_SHA, 'prepared_sha256': hashlib.sha256(prepared.read_bytes()).hexdigest()}, exclusive=True)
+            old_memory = json.loads(CHECKPOINT.read_text()) if CHECKPOINT.exists() else {}
+            useful_tick = max((e.get('tick', 0) for e in old_memory.get('history', [])
+                               if useful_event(e)), default=0)
+            # Retained verification is historical, not fresh progress on restart.
+            prior_path = RUN / 'owner-status.json'
+            prior = json.loads(prior_path.read_text()) if prior_path.exists() else {}
+            useful_at = prior.get('last_useful_action_at')
+            monitoring_started = time.time()
+            while child.poll() is None:
+                memory = json.loads(CHECKPOINT.read_text()) if CHECKPOINT.exists() else {}
+                verified = [e for e in memory.get('history', []) if useful_event(e)]
+                latest = max((e.get('tick', 0) for e in verified), default=0)
+                if latest > useful_tick:
+                    useful_tick = latest; useful_at = time.time()
+                saves = list((ROOT / 'server/saves').glob('*.zip'))
+                save_age = time.time() - max((p.stat().st_mtime for p in saves), default=0)
+                age = time.time() - useful_at if useful_at is not None else None
+                phase = ('blocked' if memory.get('status') in ('blocked', 'uncertain') else
+                         'stalled' if time.time() - (useful_at or monitoring_started) > 900 else
+                         'running' if useful_at is not None else 'awaiting_useful_progress')
+                status(phase,
+                       child_pid=child.pid, session_id=memory.get('session_id'),
+                       checkpoint_status=memory.get('status'), reason=memory.get('reason'),
+                       useful_tick=useful_tick, useful_action_age_seconds=age,
+                       last_useful_action_at=useful_at,
+                       game_save_age_seconds=save_age, game_save_stale=save_age > 660)
+                time.sleep(5)
+            code = child.returncode
+        write(RUN / (execution + '-result.json'), {'at': time.time(), 'exit_code': code,
+              'script_sha256': SCRIPT_SHA, 'prepared_sha256': hashlib.sha256(prepared.read_bytes()).hexdigest(),
+              'checkpoint_sha256': hashlib.sha256(CHECKPOINT.read_bytes()).hexdigest() if CHECKPOINT.exists() else None}, exclusive=True)
+        child = None
+        if code == 2 and not stop:
+            hold('Controller preflight rejected; preserve evidence and reconcile'); return
+        if not stop:
+            time.sleep(30)
+    status('stopped_by_service_owner')
+
+
+if __name__ == '__main__':
+    main()

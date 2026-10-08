@@ -60,3 +60,49 @@ an actual 30-second owner execution. These checks are not a Factorio
 save/reload test or proof of deployment. The separately governed owner must
 adopt the reviewed helper and its compatible source pin before the runtime
 behavior changes.
+
+## Captured owner and generator source preparation
+
+`jev_factorio.native_owner_template.prepare_native_owner_completion_source`
+prepares the captured V46 or V47 owner source offline. It requires the exact
+captured digest, inserts the typed completion preflight and rejects a completed
+return while maintenance recovery authority remains unconsumed. Unknown or
+modified inputs require a new source review. Preparing an already supported
+guarded source returns identical bytes. The function emits source only; it
+does not overwrite an owner, update admission pins, consume authority, create
+a controller or connect to the game.
+
+`prepare_native_owner_generator_source` corrects the captured
+`prepare_v47_artifacts.py` recipe before its owner-source expression renames
+V46 to V47. The generated completion branch therefore retains the same typed
+gate. Its existing source-pin assertion, version names, attempt limits and
+exclusive writes remain unchanged. Supply a separately reviewed standalone
+copy of `native_owner_template.py` named `native_owner_template509.py` beside
+the prepared generator. This avoids adding a new module to its frozen runtime
+repository or shadowing the frozen `jev_factorio` package. The complete helper,
+generator and generated-owner bundle requires exact digest/signature review.
+Neither preparation nor an existing version-number substitution grants more
+attempts, spending or time.
+
+The captured deployed V46 source has SHA256 `3e43cd362a6158134961ddae1900b20952e0469489695b402f0666a183f935a4`;
+the staged V47 source has SHA256 `19024f97c757818cce3940a19442c5ea997d628b8870db69451e087d1b114b9e`.
+The captured generator has SHA256 `520c70edcbd5bcfc7b55c1aa54efd9e93065e80babfe0baff17d3f45b6ef27ff`.
+Historical files and their admission pins stay intact. Prepared sources use
+their own byte digests; the earlier offline CRLF patch and a new LF source are
+different artifacts even when their parsed Python behavior agrees.
+
+The generator controls isolate the actual captured source expression, then
+run the actual generated owner main with private temporary files and forbidden
+child/retry interfaces. A full producer checkpoint for another target is
+incorrectly reported completed by the original generated owner and rejected
+by the corrected owner through the real typed preflight. Caller-wiring positive
+and close-failure controls use an explicit witness spy; the paired completion
+adapter tests exercise real current source-produced native rows. These controls
+are offline and do not establish deployment or native acceptance.
+
+Actual adoption remains a separate governed operation. The runtime source
+must contain the reviewed completion helper and satisfy the installed native
+asset profile; an older frozen source without that helper cannot qualify.
+The original owner lock, compatible source and owner pins, receipts, budgets,
+pending state and an unexpired authorized window are required. An expired
+campaign cannot be restarted or extended by generating a corrected script.
