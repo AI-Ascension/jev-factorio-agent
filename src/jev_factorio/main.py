@@ -560,7 +560,7 @@ def cli() -> None:
     p.add_argument("--blocked-source-revision",
                    help="Full Git commit supplied by the checkpoint owner for the blocked decision")
     p.add_argument("--two-stage-decisions", action="store_true",
-                   help="Assess candidates, then make a strict JEV choice with durable phase records")
+                   help="Assess candidates, then make a strict Jev choice with durable phase records")
     p.add_argument("--persist-recoverable-blocks", action="store_true",
                    help="Opt in to observation-only waits and changed-evidence retries for exact recoverable blocks")
     p.add_argument("--initialize-persistent-campaign", action="store_true",
@@ -695,7 +695,7 @@ def cli() -> None:
         p.error("Compatible-source pins require an explicit authorization file")
     if args.two_stage_decisions and (not args.persist_recoverable_blocks
                                      or args.controller != "hierarchical" or args.policy != "jev"):
-        p.error("--two-stage-decisions requires persistent hierarchical strict JEV control")
+        p.error("--two-stage-decisions requires persistent hierarchical strict Jev control")
     if args.persist_recoverable_blocks:
         if (not args.until_complete or args.backend != "fle" or args.controller != "hierarchical"
                 or args.policy != "jev" or args.mock_model

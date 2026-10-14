@@ -19,7 +19,7 @@ const STAGES = [
   ["Controller", "Reads the game, commits steps", "Existing validated observations and controller state publications. Opening this viewer never creates an observation or game action."],
   ["Goals", "Fuel → mining → rocket", "stockpile_fuel → bootstrap_mining → target. Completion is read from the controller's verified goal predicates, never inferred from a score."],
   ["Planner", "Works out what to build next", "The deterministic compiler prepares bounded executable prerequisites. Candidate detail is available from the actual model request or committed plan; unobserved alternatives stay unknown."],
-  ["JEV decides", "Scores the options, picks one", "Observed question batches, provider answers, duration and the controller's final selection. Raw provider answers are not accepted decisions. Utility is not confidence."],
+  ["Jev decides", "Scores the options, picks one", "Observed question batches, provider answers, duration and the controller's final selection. Raw provider answers are not accepted decisions. Utility is not confidence."],
   ["Act", "Sends the action to the game", "An existing backend call is in progress or has returned. Return acknowledgment alone does not prove the expected game effect."],
   ["Verify", "Checks the game really changed", "Prepared and ambiguous actions remain pending until the original controller verifies their effects. This viewer cannot clear, replay, or reconcile them."],
   ["Repair", "Codex fixes a stuck run", "Repair state is read from the matching supervisor. The dashboard has no repair, approval, merge, restart, or game-control endpoints."]
@@ -409,7 +409,7 @@ function render(data) {
   const chest = state.drill_output_connected;
   const observed = [
     ["Player at", position.length === 2 && position.every((n) => typeof n === "number") ? `x ${Math.round(position[0])}, y ${Math.round(position[1])}` : "—"],
-    ["Starter drill", "drill_status" in state ?Explain.drill(state.drill_status) : "—", "The first burner mining drill JEV placed"],
+    ["Starter drill", "drill_status" in state ?Explain.drill(state.drill_status) : "—", "The first burner mining drill Jev placed"],
     ["Drill fuel", typeof state.drill_fuel === "number" ? `${state.drill_fuel} coal` : "—"],
     ["Drill output chest", chest === true ? "In place" : chest === false ? "None yet" : "—", "A chest under the drill catches its ore"],
     ["Ore in that chest", chest === false ? "n/a" : text(state.iron_ore_collected)],
@@ -433,7 +433,7 @@ function render(data) {
   const pending = object(v.pending);
   const hasPending = Object.keys(pending).length > 0;
   set("verification-status", hasPending ? `Pending: ${acting(pending.action)}` : v.verified === true ? "Confirmed by the game" : "Nothing to confirm right now");
-  set("verification-detail", hasPending ? (pending.dispatch === "ambiguous" ? "The game didn't acknowledge the action cleanly. JEV watches for its effect before changing anything else." : "Sent to the game. JEV watches for its effect before moving on.") : v.verified === true ? Explain.event(v).text : "Returned ≠ verified. Only an observed change in the game advances a step.");
+  set("verification-detail", hasPending ? (pending.dispatch === "ambiguous" ? "The game didn't acknowledge the action cleanly. Jev watches for its effect before changing anything else." : "Sent to the game. Jev watches for its effect before moving on.") : v.verified === true ? Explain.event(v).text : "Returned ≠ verified. Only an observed change in the game advances a step.");
   const tick = typeof state.tick === "number" ? state.tick : v.tick;
   const waited = hasPending && typeof pending.started_tick === "number" && typeof tick === "number" ? Math.max(0, Math.round((tick - pending.started_tick) / 60)) : null;
   $("pending-check").classList.toggle("active", hasPending);
@@ -483,7 +483,7 @@ function refreshStatus() {
   const checking = legacy && Object.keys(object(v.pending)).length > 0;
   $("signal").classList.toggle("active", thinking || (checking && !stale && !frozen));
   const ago = age === null ? "" : age < 5 ? "just now" : age < 120 ? `${Math.floor(age)}s ago` : `${Math.floor(age / 60)}m ago`;
-  set("thinking-status", frozen ? "Display frozen" : unresolvedDecision && active ? "Decision outcome unknown · observing for changed evidence" : waitingForChangedEvidence && active ? "Blocked · waiting for changed game evidence" : evaluatingChangedEvidence && active ? "Re-evaluating changed game evidence" : thinking ? "JEV is evaluating" : recorded ? Explain.event(v).text : ended ? "Controller invocation ended" : stale ? "Awaiting fresh evidence" : text(v.kind, "Waiting for an agent").replaceAll("_", " "));
+  set("thinking-status", frozen ? "Display frozen" : unresolvedDecision && active ? "Decision outcome unknown · observing for changed evidence" : waitingForChangedEvidence && active ? "Blocked · waiting for changed game evidence" : evaluatingChangedEvidence && active ? "Re-evaluating changed game evidence" : thinking ? "Jev is evaluating" : recorded ? Explain.event(v).text : ended ? "Controller invocation ended" : stale ? "Awaiting fresh evidence" : text(v.kind, "Waiting for an agent").replaceAll("_", " "));
   set("model-detail", unresolvedDecision && active ? `No repeat model request · next observation in ${number(recovery.next_observation_seconds, 0)}s · game status remains ${text(v.status, "unchanged")}`
     : active && waitingForChangedEvidence ? `${text(recovery.reason, "Recoverable decision block")} · next observation in ${number(recovery.next_observation_seconds, 0)}s · no gameplay action running`
     : active && evaluatingChangedEvidence ? `${text(recovery.reason, "Recoverable decision block")} · checking changed native evidence before another selection`
@@ -584,7 +584,7 @@ $("broadcast").onclick = () => setBroadcast(!broadcast);
 $("freeze").onclick = () => { frozen = !frozen; document.body.classList.toggle("frozen", frozen); $("freeze").setAttribute("aria-pressed", String(frozen)); set("freeze", frozen ? "▶ Resume display" : "Ⅱ Freeze display"); if (!frozen && latest) render(latest); else if (displayed) render(displayed); };
 $("event-filter").onchange = () => { if (displayed) renderLog(displayed); };
 $("close-inspector").onclick = () => $("inspector").close();
-$("inspect-model").onclick = () => inspect("JEV request & response", STAGES[4][2], stageEvidence(4));
+$("inspect-model").onclick = () => inspect("Jev request & response", STAGES[4][2], stageEvidence(4));
 $("inspect-plan").onclick = () => inspect("Committed plan", STAGES[3][2], stageEvidence(3));
 $("inspect-pending").onclick = () => inspect("Pending-action evidence", STAGES[6][2], stageEvidence(6));
 $("export").onclick = () => {

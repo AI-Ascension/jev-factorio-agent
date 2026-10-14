@@ -87,7 +87,7 @@ def test_current_work_clears_prior_blocked_caption(live, next_kind):
     playwright.expect(page.locator('#model-detail')).to_contain_text('no gameplay action running')
     if next_kind == 'model_started':
         writer.emit('model_started', 5)
-        playwright.expect(page.locator('#thinking-status')).to_have_text('JEV is evaluating')
+        playwright.expect(page.locator('#thinking-status')).to_have_text('Jev is evaluating')
     else:
         writer.emit('controller_state', 2, status='running', pending={'action': 'factory_gather'})
         writer.emit('action', 6, action='factory_gather', parameters={'resource': 'iron-ore'})
@@ -143,7 +143,7 @@ def test_live_decision_capture_freeze_inspector_and_overlay(live, tmp_path):
     page.on("request", lambda req: requests.append(req.url))
     page.goto(url)
     plan = seed(writer)
-    playwright.expect(page.locator("#thinking-status")).to_have_text("JEV is evaluating")
+    playwright.expect(page.locator("#thinking-status")).to_have_text("Jev is evaluating")
     playwright.expect(page.locator("#candidate-count")).to_have_text("2 MODEL CANDIDATES")
     page.locator("#capture-main").click()
     page.wait_for_function("document.querySelector('#game-video').videoWidth === 960")
@@ -237,7 +237,7 @@ def test_factory_theme_is_accessible_without_external_artwork(live):
     page, writer, url, errors = live
     page.goto(url)
     seed(writer)
-    playwright.expect(page).to_have_title("JEV · Factorio Mission Control")
+    playwright.expect(page).to_have_title("Jev · Factorio Mission Control")
     playwright.expect(page.locator(".brand-gear")).to_be_visible()
     assert page.locator(".brand-gear").get_attribute("aria-hidden") == "true"
     assert page.locator(".panel").first.evaluate("(element) => getComputedStyle(element).borderRadius") == "4px"
@@ -301,7 +301,7 @@ def test_candidate_focus_survives_heartbeats_and_new_records(live):
     plan = seed(writer)
     button = page.locator("#candidates button").first
     playwright.expect(button).to_be_visible()
-    playwright.expect(page.locator("#thinking-status")).to_have_text("JEV is evaluating")
+    playwright.expect(page.locator("#thinking-status")).to_have_text("Jev is evaluating")
     page.evaluate("""() => {
         window.candidateMutations = 0;
         new MutationObserver(() => window.candidateMutations++).observe(
@@ -323,7 +323,7 @@ def test_transport_cadence_and_record_to_screen_latency(live):
     page, writer, url, errors = live
     page.goto(url)
     seed(writer)
-    playwright.expect(page.locator("#thinking-status")).to_have_text("JEV is evaluating")
+    playwright.expect(page.locator("#thinking-status")).to_have_text("Jev is evaluating")
     page.evaluate("""() => {
         window.snapshotTimes = [];
         events.addEventListener("snapshot", () => window.snapshotTimes.push(performance.now()));
@@ -448,7 +448,7 @@ def test_stale_disconnected_and_delayed_feed_indicators(live):
     page, writer, url, errors = live
     page.goto(url)
     seed(writer)
-    playwright.expect(page.locator("#thinking-status")).to_have_text("JEV is evaluating")
+    playwright.expect(page.locator("#thinking-status")).to_have_text("Jev is evaluating")
     status = page.evaluate("""() => {
         const snapshot = JSON.parse(JSON.stringify(latest));
         snapshot.view.last_event_time = snapshot.server_time - 30;
@@ -480,7 +480,7 @@ def test_legacy_missing_details_are_unavailable_not_zero_or_no_response(live):
     page, writer, url, errors = live
     page.goto(url)
     seed(writer)
-    playwright.expect(page.locator("#thinking-status")).to_have_text("JEV is evaluating")
+    playwright.expect(page.locator("#thinking-status")).to_have_text("Jev is evaluating")
     labels = page.evaluate("""() => {
         const snapshot = JSON.parse(JSON.stringify(latest));
         snapshot.source.mode = "legacy";
@@ -503,7 +503,7 @@ def test_recorded_evidence_ticker_and_actions_do_not_claim_live_phase(live):
     page.set_viewport_size({"width": 1920, "height": 1080})
     page.goto(url + "/?studio=1")
     seed(writer)
-    playwright.expect(page.locator("#thinking-status")).to_have_text("JEV is evaluating")
+    playwright.expect(page.locator("#thinking-status")).to_have_text("Jev is evaluating")
     result = page.evaluate("""() => {
         events.close();
         const before = document.querySelector(".game-stage").getBoundingClientRect();
@@ -1185,7 +1185,7 @@ def test_run_time_ignores_a_supervisor_for_another_session(live):
         "session_id": "another-session", "phase": "gameplay", "started_at": time.time() - 60}))
     page.goto(url)
     seed(writer)
-    playwright.expect(page.locator("#thinking-status")).to_have_text("JEV is evaluating")
+    playwright.expect(page.locator("#thinking-status")).to_have_text("Jev is evaluating")
     playwright.expect(page.locator("#run-time")).to_have_text("Not connected")
     assert not errors
 
@@ -1245,7 +1245,7 @@ def test_research_strip_stays_hidden_for_a_tree_from_another_version(live):
     seed(writer)
     research_catalog.write(writer.path.with_name(research_catalog.FILENAME), raw_catalog(DATA_20))
     research_seed(writer, ["automation", "a-technology-this-tree-does-not-have"])
-    playwright.expect(page.locator("#thinking-status")).to_have_text("JEV is evaluating")
+    playwright.expect(page.locator("#thinking-status")).to_have_text("Jev is evaluating")
     page.wait_for_timeout(800)
     playwright.expect(page.locator("#research-strip")).to_be_hidden()
     playwright.expect(page.locator('[data-milestone="steam-power"]')).to_be_visible()

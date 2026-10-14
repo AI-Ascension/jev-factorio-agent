@@ -19,12 +19,13 @@ def run_event_cli(tmp_path, event_text):
 
 
 def test_cli_rejects_historical_negated_closing_forms(tmp_path):
+    # "fork-owner" is a deliberate placeholder for a foreign-owner cross-repo reference.
     event = {
         "pull_request": {
             "body": (
                 "Does not close #103 or #245. "
                 "This does not resolve #96's remaining attribution work. "
-                "Don't fix CompleteDotTech/jev-factorio-agent#95. "
+                "Don't fix fork-owner/jev-factorio-agent#95. "
                 "Do not close https://github.com/jevplays-games/jev-factorio-agent/issues/94."
             )
         }
@@ -35,7 +36,7 @@ def test_cli_rejects_historical_negated_closing_forms(tmp_path):
     assert result.returncode == 1
     assert "Does not close #103" in result.stdout
     assert "does not resolve #96" in result.stdout
-    assert "Don't fix CompleteDotTech/jev-factorio-agent#95" in result.stdout
+    assert "Don't fix fork-owner/jev-factorio-agent#95" in result.stdout
     assert "Do not close https://github.com/jevplays-games/jev-factorio-agent/issues/94" in result.stdout
 
 
@@ -56,7 +57,7 @@ def test_cli_accepts_neutral_refs_and_positive_closing_references(tmp_path):
     event = {
         "pull_request": {
             "body": (
-                "Refs #103 and CompleteDotTech/jev-factorio-agent#245. "
+                "Refs #103 and fork-owner/jev-factorio-agent#245. "
                 "This does not complete the broader rollout. "
                 "Fixes https://github.com/jevplays-games/jev-factorio-agent/issues/251."
             )

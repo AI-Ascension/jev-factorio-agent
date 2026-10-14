@@ -1,7 +1,7 @@
 # September 25 campaign throughput implementation
 
 Implements the code-side recommendations in the
-[production progress analysis](https://github.com/CompleteDotTech/jev-factorio-agent/blob/evidence/campaign-progress-20260925/docs/FACTORIO_PROGRESS_ANALYSIS_2026-09-25.md),
+[production progress analysis](https://github.com/jevplays-games/jev-factorio-agent/blob/evidence/campaign-progress-20260925/docs/FACTORIO_PROGRESS_ANALYSIS_2026-09-25.md),
 against analyzed revision `a88963db68031b61988effb1bbe655667caa12bb`.
 The evidence branch stays analysis-only. No running game, save, production
 configuration, supervisor cutoff, ownership record or failure budget is changed
