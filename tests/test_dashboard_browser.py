@@ -146,7 +146,7 @@ def test_live_decision_capture_freeze_inspector_and_overlay(live, tmp_path):
     playwright.expect(page.locator("#thinking-status")).to_have_text("Jev is evaluating")
     playwright.expect(page.locator("#candidate-count")).to_have_text("2 MODEL CANDIDATES")
     page.locator("#capture-main").click()
-    page.wait_for_function("document.querySelector('#game-video').videoWidth === 960")
+    page.wait_for_function("() => document.querySelector('#game-video').videoWidth === 960")
     playwright.expect(page.locator("#video-status")).to_have_text("WINDOW CAPTURE")
     page.locator("#inspect-model").click()
     playwright.expect(page.locator("#inspector-content")).to_contain_text("coal-buffer")
@@ -195,7 +195,7 @@ def test_obs_camera_selection_and_stop(live):
     page.locator("#camera").click()
     playwright.expect(page.locator("#camera-devices")).to_be_visible()
     playwright.expect(page.locator("#camera-devices")).to_contain_text("OBS Virtual Camera")
-    page.wait_for_function("document.querySelector('#game-video').videoWidth === 960")
+    page.wait_for_function("() => document.querySelector('#game-video').videoWidth === 960")
     page.locator("#stop-capture").click()
     assert page.evaluate("window.testCapture.getVideoTracks()[0].readyState") == "ended"
     assert not errors
@@ -402,7 +402,7 @@ def test_capture_replacement_cancel_fullscreen_and_track_end(live):
     page.goto(url)
     seed(writer)
     page.locator("#capture").click()
-    page.wait_for_function("document.querySelector('#game-video').videoWidth === 960")
+    page.wait_for_function("() => document.querySelector('#game-video').videoWidth === 960")
     page.evaluate("window.oldTrack = window.testCapture.getVideoTracks()[0]")
     page.locator("#camera").click()
     playwright.expect(page.locator("#video-status")).to_have_text("CAMERA / OBS")
@@ -560,7 +560,7 @@ def test_camera_device_switch_and_playback_failure_cleanup(live):
     playwright.expect(page.locator("#camera-devices")).to_be_visible()
     page.evaluate("window.priorCamera = window.testCapture.getVideoTracks()[0]")
     page.locator("#camera-devices").select_option("alternate")
-    page.wait_for_function("window.lastConstraints.video.deviceId?.exact === 'alternate'")
+    page.wait_for_function("() => window.lastConstraints.video.deviceId?.exact === 'alternate'")
     playwright.expect(page.locator("#camera-devices")).to_have_value("alternate")
     assert page.evaluate("window.priorCamera.readyState") == "ended"
     assert page.evaluate("window.lastConstraints.audio") is False
@@ -585,14 +585,14 @@ def test_late_capture_permission_is_released_after_page_exit(live):
     })""")
     page.goto(url)
     page.locator("#capture").click()
-    page.wait_for_function("typeof window.deliverCapture === 'function'")
+    page.wait_for_function("() => typeof window.deliverCapture === 'function'")
     page.evaluate("""() => {
         window.dispatchEvent(new PageTransitionEvent("pagehide"));
         const canvas = document.createElement("canvas");
         window.lateStream = canvas.captureStream(1);
         window.deliverCapture(window.lateStream);
     }""")
-    page.wait_for_function("window.lateStream.getVideoTracks()[0].readyState === 'ended'")
+    page.wait_for_function("() => window.lateStream.getVideoTracks()[0].readyState === 'ended'")
     assert page.evaluate("document.querySelector('#game-video').srcObject === null")
     assert not errors
 
