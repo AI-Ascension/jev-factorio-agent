@@ -395,18 +395,18 @@ def banner(state):
         return ''
     if status == 'crafting':
         craft = state['craft_progress']
-        return (f"JEV crafting: {craft['finished']}/{craft['requested']} batches"
+        return (f"Jev crafting: {craft['finished']}/{craft['requested']} batches"
                 f" | Foreground waiting: {state['foreground_reason']}")[:240]
     if status == 'researching':
         research = state['research_progress']
-        return (f"JEV researching: {research['technology']} {research['progress']:.1%}"
+        return (f"Jev researching: {research['technology']} {research['progress']:.1%}"
                 f" | Foreground waiting: {state['foreground_reason']}")[:240]
     if status == 'smelting':
-        return ("JEV smelting: native furnace production advancing"
+        return ("Jev smelting: native furnace production advancing"
                 f" | Foreground waiting: {state['foreground_reason']}")[:240]
     age = state.get('progress_age_seconds')
     suffix = f' | {int(age // 60)}m since progress' if number(age) else ''
-    return ('JEV ' + status.replace('_', ' ') + ': ' + state['reason'] + suffix)[:240]
+    return ('Jev ' + status.replace('_', ' ') + ': ' + state['reason'] + suffix)[:240]
 
 
 def read_json(path, limit=65536):

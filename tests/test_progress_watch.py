@@ -204,7 +204,7 @@ def test_native_craft_counters_distinguish_foreground_policy_wait(reason):
     assert second['blocked_age_seconds'] == second['progress_age_seconds'] == 15
     assert second['last_progress_at'] == first['last_progress_at']
     assert second['automatic_recovery_allowed'] is False
-    assert banner(second) == f'JEV crafting: 18/20 batches | Foreground waiting: {reason}'
+    assert banner(second) == f'Jev crafting: 18/20 batches | Foreground waiting: {reason}'
     # Observer restart, unchanged counters and a fresh heartbeat do not extend
     # the craft-progress window or erase the original foreground wait time.
     stale = classify({**waiting, 'at': 1791253680, 'background_craft': advanced},

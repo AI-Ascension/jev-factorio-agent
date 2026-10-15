@@ -1071,7 +1071,8 @@ def test_code_verification_rejects_split_fetch_and_push_fork_owners(supervisor, 
         if command == ["git", "remote", "get-url", "--push", "--all", "origin"]:
             return 0, "git@github.com:jevplays-games/jev-factorio-agent.git"
         if command == ["git", "remote", "get-url", "--all", "fork"]:
-            return 0, "git@github.com:timotgl/jev-factorio-agent.git"
+            # "fork-owner" is a deliberate foreign-owner fork remote, not a real account.
+            return 0, "git@github.com:fork-owner/jev-factorio-agent.git"
         if command == ["git", "remote", "get-url", "--push", "--all", "fork"]:
             return 0, "git@github.com:other-owner/jev-factorio-agent.git"
         pytest.fail(f"unexpected verification command: {command}")
@@ -1125,8 +1126,9 @@ def test_code_verification_rechecks_source_after_tests(supervisor, monkeypatch, 
         (0, commit), (0, ""), (0, "origin\nfork"),
         (0, "git@github.com:jevplays-games/jev-factorio-agent.git"),
         (0, "git@github.com:jevplays-games/jev-factorio-agent.git"),
-        (0, "git@github.com:timotgl/jev-factorio-agent.git"),
-        (0, "git@github.com:timotgl/jev-factorio-agent.git"),
+        # "fork-owner" is a deliberate foreign-owner fork remote, not a real account.
+        (0, "git@github.com:fork-owner/jev-factorio-agent.git"),
+        (0, "git@github.com:fork-owner/jev-factorio-agent.git"),
         (0, commit + "\trefs/heads/main"), (0, commit + "\trefs/heads/main"),
         (0, json.dumps(pull)),
         (0, _graphql_review_page(pull)),
@@ -1192,12 +1194,13 @@ def test_code_verification_requires_origin_and_checks_configured_fork(
             assert command[4] in remotes.splitlines()
             return 0, ('https://github.com/jevplays-games/jev-factorio-agent.git'
                        if command[4] == 'origin'
-                       else 'git@github.com:timotgl/jev-factorio-agent.git')
+                       # "fork-owner" is a deliberate foreign-owner fork remote, not a real account.
+                       else 'git@github.com:fork-owner/jev-factorio-agent.git')
         if command[:4] == ['git', 'remote', 'get-url', '--push']:
             assert command[4] == '--all' and command[5] in remotes.splitlines()
             return 0, ('https://github.com/jevplays-games/jev-factorio-agent.git'
                        if command[5] == 'origin'
-                       else 'git@github.com:timotgl/jev-factorio-agent.git')
+                       else 'git@github.com:fork-owner/jev-factorio-agent.git')
         if command[:2] == ['git', 'ls-remote']:
             assert command[2] in remotes.splitlines()
             return 0, (fork_head if command[2] == 'fork' else commit) + '\trefs/heads/main'

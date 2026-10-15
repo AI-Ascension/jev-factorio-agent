@@ -1,7 +1,7 @@
 # JEV Factorio workflow atlas
 
 A source-reviewed map of campaign supervision, planning, native execution, and
-recovery. Reviewed against [`761ffc8`](https://github.com/CompleteDotTech/jev-factorio-agent/tree/761ffc8),
+recovery. Reviewed against [`761ffc8`](https://github.com/jevplays-games/jev-factorio-agent/tree/761ffc8),
 including the partial gameplay and latency changes in PR #108. The maps describe
 implemented branches and optional capabilities; they do not attest a live
 campaign's configuration, deployment, or native acceptance.

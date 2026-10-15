@@ -1,17 +1,32 @@
-<p align="center"><img src="assets/banner.jpg" alt="Pixel-art robot Jev operating conveyor belts, machines and robotic arms in a neon-lit factory" width="100%"></p>
+<p align="center"><img src="assets/banner.png" alt="Pink and ink pixel-window banner reading Jev Factorio Agent, with the boxy Jev robot beside a small conveyor belt and windows for goal, work orders and throughput" width="100%"></p>
 
-# jev-factorio
+<div align="center">
 
-A Jev-powered Factorio agent. Jev (TypeSafe AI's System One model) makes the
-fast macro decisions - goal, next action, stuck detection - as typed
-Choice/Score/Noul questions; deterministic code owns game rules, option
-filtering, and actuation. To our knowledge this is the first Jev-driven
-game agent.
+# Jev Factorio Agent
 
-Docs: [ARCHITECTURE](docs/ARCHITECTURE.md) | [BUILD PLAN](docs/BUILD_PLAN.md) | [Latency attribution](docs/LATENCY_ATTRIBUTION.md)
+**A Factorio agent in which Jev chooses goals and actions as typed questions while deterministic code owns game rules and actuation.**
 
-For bounded native runs with error-triggered Codex repair and guarded relaunch,
-see [Autonomous campaign supervision](docs/AUTONOMOUS_SUPERVISION.md).
+![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-F386A1?style=flat-square&labelColor=1E1E1E)
+![Factorio 2.0](https://img.shields.io/badge/Factorio-2.0-F386A1?style=flat-square&labelColor=1E1E1E)
+![Status: experimental](https://img.shields.io/badge/Status-experimental-E551BA?style=flat-square&labelColor=1E1E1E)
+![License: MIT](https://img.shields.io/badge/License-MIT-DEDEDE?style=flat-square&labelColor=1E1E1E)
+
+[Quick start](#quick-start-offline-no-key-no-game) · [How it works](#how-it-works) · [Live Factorio](#live-factorio) · [Hierarchical controller](#hierarchical-controller-opt-in) · [Docs](docs/ARCHITECTURE.md) · [Engineering log](docs/ENGINEERING_LOG.md)
+
+</div>
+
+---
+
+> [!NOTE]
+> **Shipped:** the offline mock loop, the flat and hierarchical controllers, the
+> dedicated-world FLE adapter, research logging, the campaign supervisor and the
+> read-only dashboard. CI runs the unit suite on Python 3.10, 3.12 and 3.13 plus
+> an offline hierarchical smoke run with sealed research evidence.
+> **Not measured live:** no complete native rocket-launch playthrough is verified,
+> and the experimental extensions in the [engineering log](docs/ENGINEERING_LOG.md)
+> are source integrations whose native throughput benefit has not been measured.
+> **Upstream:** this project derives from `Adibrill1/jev-factorio`, which publishes
+> no license file; see [License and attribution](#license-and-attribution).
 
 ## Quick start (offline, no key, no game)
 
@@ -23,6 +38,36 @@ PYTHONPATH=src python -m jev_factorio --backend mock --steps 8 --tick-seconds 0
 
 With a real key (`TYPESAFE_API_KEY` in the environment) the same loop calls
 `jev-latest` at `https://api.typesafe.ai/v1/systemone`.
+
+
+## How it works
+
+Jev (TypeSafe AI's System One model) makes the fast macro decisions - goal, next
+action, stuck detection - as typed Choice/Score/Noul questions; deterministic
+code owns game rules, option filtering, and actuation. To our knowledge this is
+the first Jev-driven game agent.
+
+```mermaid
+flowchart LR
+    obs["Observe<br/>game snapshot"]:::code --> filt["Filter legal<br/>candidate actions"]:::code
+    filt --> ask["Typed question<br/>Choice / Score / Noul"]:::code
+    ask --> jev["Jev<br/>System One"]:::jev
+    jev --> gate{"Confidence<br/>gate"}:::code
+    gate -->|confident| act["Native action<br/>mock / FLE backend"]:::code
+    gate -->|abstain| obs
+    act --> verify["Verify effect<br/>in game state"]:::verify
+    verify --> obs
+
+    classDef jev fill:#F386A1,stroke:#1E1E1E,color:#1E1E1E
+    classDef code fill:#DEDEDE,stroke:#1E1E1E,color:#1E1E1E
+    classDef verify fill:#1E1E1E,stroke:#1E1E1E,color:#FEFEFE
+    linkStyle default stroke:#E551BA
+```
+
+Docs: [Architecture](docs/ARCHITECTURE.md) · [Build plan](docs/BUILD_PLAN.md) ·
+[Latency attribution](docs/LATENCY_ATTRIBUTION.md). For bounded native runs with
+error-triggered Codex repair and guarded relaunch, see
+[Autonomous campaign supervision](docs/AUTONOMOUS_SUPERVISION.md).
 
 ## Local configuration
 
@@ -65,13 +110,6 @@ An opt-in [owner step gate](docs/OWNER_STEP_GATE.md) can keep one resumed native
 process alive across a bounded number of individually reviewed steps; it does
 not authorize a live controller without the existing owner and native checks.
 
-## Layout
-
-- `src/jev_factorio/state.py` - GameSnapshot + compact Jev-facing state
-- `src/jev_factorio/questions.py` - typed question builders + candidate-action filter
-- `src/jev_factorio/jev_client.py` - SDK/HTTP client + offline MockJevClient
-- `src/jev_factorio/loop.py` - observe -> ask -> gate on confidence -> act
-- `src/jev_factorio/backends/` - mock, dedicated-world FLE adapter, play_api (skeleton)
 
 ## Live Factorio
 
@@ -129,7 +167,7 @@ actions above, not full-game progression.
 ## Hierarchical controller (opt-in)
 
 The [hierarchical controller guide](docs/HIERARCHICAL_CONTROLLER.md) describes
-persistent goals, batched JEV candidate evaluation, verified skill plans,
+persistent goals, batched Jev candidate evaluation, verified skill plans,
 checkpoint recovery, and deterministic comparison runs.
 
 The [performance investigation prompt](docs/PERFORMANCE_INVESTIGATION_PROMPT.md)
@@ -153,7 +191,7 @@ python -m jev_factorio --controller hierarchical --backend fle --resume \
   --checkpoint runs/campaign-state.json --log-file runs/campaign.jsonl
 ```
 
-`hybrid` records JEV abstentions and uses a deterministic compiled plan when
+`hybrid` records Jev abstentions and uses a deterministic compiled plan when
 needed; `jev` remains strict. The agent carries solids between machines and builds
 physical fluid and electricity connections. Native crafting, inventories,
 research, and the force rocket-launch counter verify progress. Movement and
@@ -268,125 +306,54 @@ do not reset the world or discard a pending checkpoint to work around a failure.
 The implementation is restricted to the exported Factorio 2.0 base-game catalog;
 unsupported mods, recipes, or bounded exploration failures stop explicitly.
 
-## Author
 
-Built by **Timothy Wayne Gregg** (CompleteTech LLC, Cincinnati, OH).
+## Repository layout
 
-- GitHub: <https://github.com/CompleteDotTech>
-- Website: <https://www.complete.tech>
-- Email: timothy.gregg@complete.tech
+```text
+jev-factorio-agent/
+├── src/jev_factorio/
+│   ├── state.py            # GameSnapshot + compact Jev-facing state
+│   ├── questions.py        # typed question builders + candidate-action filter
+│   ├── jev_client.py       # SDK/HTTP client + offline MockJevClient
+│   ├── loop.py             # observe -> ask -> gate on confidence -> act
+│   ├── controller.py       # hierarchical controller
+│   ├── supervisor.py       # autonomous campaign supervision
+│   ├── dashboard.py        # read-only local dashboard (dashboard_assets/)
+│   ├── backends/           # mock, dedicated-world FLE adapter, play_api (skeleton)
+│   ├── planning/           # goals, production, research and service planning
+│   └── lua/                # native Factorio-side modules used through RCON
+├── tests/                  # pytest suite and fixtures
+├── docs/                   # architecture, runbooks and the engineering log
+├── benchmarks/             # offline benchmarks
+├── scripts/                # PR reference check, OBS launcher, checkpoint benchmark
+└── assets/                 # banner, social preview and their HTML sources
+```
 
-## License
+## Contributing
 
-MIT - see [LICENSE](LICENSE). Copyright 2026 Timothy Wayne Gregg (CompleteTech LLC).
+1. Create a virtual environment and install the test extras:
+   `python -m pip install -e '.[test]'`.
+2. Run `python -m pytest tests/ -q` before opening a pull request. Dashboard
+   browser tests need `pip install -e '.[dashboard-test]'` and
+   `python -m playwright install chromium`.
+3. Fill in the [pull request template](.github/pull_request_template.md):
+   separate source, fixture and native gameplay evidence, and use `Refs #...`
+   for related open work. Never use negated closing phrases; CI rejects them.
+4. Read [AGENTS.md](AGENTS.md) before touching live runs, supervisors or the
+   stream overlay.
+
+## License and attribution
+
+MIT - see [LICENSE](LICENSE). Copyright (c) 2026 Timothy Gregg, CompleteTech LLC.
 
 This project derives from `Adibrill1/jev-factorio`, which publishes no license
 file. The MIT grant here covers CompleteTech's own additions and modifications;
 confirm the upstream terms with that project's author before reusing the
 inherited skeleton elsewhere.
 
-### Mining automation for existing manual cells
+---
 
-The opt-in `--mining-outposts` extension adds paid iron/copper drill-to-chest
-outposts when an established furnace lacks a supported direct input route.
-Existing furnaces and receipts remain unchanged; ore is collected only after
-native flow evidence and then hauled in batches. See
-[Mining outposts](docs/MINING_OUTPOSTS.md) for required controller flags,
-idle-boundary checkpoint enablement, supervisor handoff limits, and native
-benchmark requirements. This is not full belt transport or a live deployment.
-
-## Planning efficiency and staged autonomy
-
-The [bounded planning and autonomy plan](docs/PLANNING_AUTONOMY.md) documents
-snapshot-local planning improvements, safe additive expansion requirements, and
-development VM acceptance gates. The [offline evidence audit](docs/EVIDENCE_AUDIT.md)
-verifies capture hashes and reports measurement coverage without contacting a
-backend or treating missing gameplay metrics as zero. Source integration is not
-production cutover or proof of native throughput improvement.
-
-## Ore-side successors
-
-The opt-in [ore-side successor lifecycle](docs/ORE_SIDE_SUCCESSORS.md) adds separately owned
-production, paid construction, native flow checks and bounded downstream-use
-qualification without replacing the established factory. Development VM
-validation and production cutover remain separate gates.
-
-## Native acceptance preparation
-
-[Native acceptance tooling](docs/NATIVE_ACCEPTANCE.md) provides a fixed read-only development
-preflight, private checksummed operational captures and paired measurement
-checks. It never starts gameplay or authorizes production cutover.
-
-## First-rocket launch prerequisites
-
-[Launch readiness](docs/LAUNCH_READINESS.md) adds paid landing-pad construction or
-reuse, bounded timed fish acquisition/satellite fallback, reserved cargo loading,
-and native guarded launch for unmodified base 2.0.77. Existing production and
-pending-action history are retained. Synthetic tests do not replace the native
-development-VM and production cutover gates.
-
-## Campaign throughput diagnostics and dev pilots
-
-[Campaign throughput](docs/CAMPAIGN_THROUGHPUT.md) implements the September 25
-progress analysis with opt-in observation profiling/consolidation, bounded
-lead-time science supply, progress alerts and conservative research lookahead.
-Controller and supervisor treatment flags remain explicit and default off.
-Offline reports separate useful science consumption from action counts; source
-integration and synthetic tests do not prove native improvement or authorize
-production cutover.
-
-## Gameplay/latency tracker #103 (offline work, acceptance pending)
-
-The [implementation/evidence boundaries](docs/ISSUE_103_OFFLINE_IMPLEMENTATION.md)
-describe the maintenance, grouped-fuel, planner-reuse, checkpoint and attribution
-changes. The [read-only capacity audit](docs/CAPACITY_AUDIT.md) and
-[native acceptance runbook](docs/NATIVE_ACCEPTANCE_103.md) do not authorize a live
-change or prove native progress. General solid transport and its coal/downstream
-consumers remain separate implementation work; keep #92/#103 open until their
-actual native requirements are met.
-
-The [grouped manual fuel policy](docs/GROUPED_FUEL_POLICY.md) documents bounded
-service/reserves, observation-only depletion estimates and unchanged failure/receipt
-authority. Its fixture results do not establish native throughput or coal automation.
-
-## Experimental solid-route foundation
-
-The [solid-corridor contract and qualification boundary](docs/SOLID_ROUTES_100.md)
-implements an opt-in Python composition API for paid straight corridors. It is
-not exposed as a production CLI/supervisor treatment. Python/Lua fixtures do not
-establish native transport, coal-network capability or campaign acceptance; see
-#100 and #92 for the remaining gates.
-See [negotiated atomic observation v2](docs/ATOMIC_OBSERVATION.md) for the optional single-command read contract, query bounds and native qualification boundary.
-
-### Bounded downstream solid investment (source-only follow-up)
-
-The experimental solid-route composition can opt into `solid_science_policy=True`
-with its explicit intent allowlist. It preserves ready science, requires the paid
-kit already carried, and labels estimated payback separately from verified
-service-history evidence. See [policy boundaries](docs/SOLID_INVESTMENT_102.md)
-and [resume review corrections](docs/SOLID_RESUME_REVIEW.md). This does not enable
-a production CLI treatment or qualify a native campaign.
-
-### Experimental coal-source bundles
-
-The explicit source-only [coal supply experiment](docs/COAL_SUPPLY_EXPERIMENT.md)
-adds paid independent electric coal branches, bounded explicit mixed downstream
-routes, shared remaining-kit locks and checkpoint recovery tests. The complete
-intent list stays immutable and uses at most four disjoint routes. It is not
-enabled by the production CLI or supervisor. Automatic coal kit acquisition and the
-coal demand/payback policy remain incomplete; modeled builds do not establish
-native flow, a complete production treatment, or acceptance in #101/#92/#103.
-# Signed compatible recovery across earlier changed-contract epochs
-
-An equal-contract recovery can follow an earlier, consumed changed-contract
-handoff without rewriting the old compatible-source records. A discontinuity
-requires a separate signed epoch-boundary witness. The supervisor authenticates
-the complete terminal checkpoint and retained source receipts before signing
-the witness; its complete body binds the new authorization digest, prior epoch,
-ordered consumed handoffs, event preimages, and current epoch endpoint.
-
-Reload verifies the signature against the independently enrolled public signer
-bytes and checks the unchanged consumed ledger. The signed event preimages remain
-available after ordinary history rolls out. Only sources in the newest compatible
-epoch share selection budgets. This does not authorize another once-only decision,
-reset a budget, or make unsigned checkpoint history an authority.
+<p align="center">
+<sub>A jevplay.games project · Steward: CompleteTech LLC · MIT licensed<br>
+Not an official TypeSafe AI publication; the pink, ink and pixel-window styling is a nod to <a href="https://typesafe.ai">typesafe.ai</a>. Jev, System One and TypeSafe are their respective owners' names. Factorio is a trademark of Wube Software; this project isn't affiliated with Wube.</sub>
+</p>

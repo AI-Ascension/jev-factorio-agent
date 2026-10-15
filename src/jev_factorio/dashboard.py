@@ -1288,7 +1288,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def cli() -> None:
-    parser = argparse.ArgumentParser(description="Local, read-only JEV workflow dashboard")
+    parser = argparse.ArgumentParser(description="Local, read-only Jev workflow dashboard")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--events", type=Path, help="Live --dashboard-events JSONL (may not exist yet)")
     source.add_argument("--log-file", type=Path, help="Existing legacy JSONL; completed-decision detail only")
@@ -1311,7 +1311,7 @@ def cli() -> None:
     server = DashboardServer(args.port, monitor, args.icon_dir)
     follower = threading.Thread(target=monitor.follow, daemon=True)
     follower.start()
-    print(f"JEV dashboard: http://127.0.0.1:{server.server_port} (read-only; Ctrl+C stops only the viewer)", flush=True)
+    print(f"Jev dashboard: http://127.0.0.1:{server.server_port} (read-only; Ctrl+C stops only the viewer)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
