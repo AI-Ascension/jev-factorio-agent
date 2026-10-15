@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/banner.png" alt="Pink and ink pixel-window banner reading Jev Factorio Agent, with the Jev robot holding a wrench beside a conveyor belt and windows for goal, work orders and throughput" width="100%"></p>
+<p align="center"><img src="assets/banner.png" alt="Pink and ink pixel-window banner reading Jev Factorio Agent, with the boxy Jev robot beside a small conveyor belt and windows for goal, work orders and throughput" width="100%"></p>
 
 <div align="center">
 

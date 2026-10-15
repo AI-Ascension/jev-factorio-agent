@@ -73,7 +73,6 @@ implements an opt-in Python composition API for paid straight corridors. It is
 not exposed as a production CLI/supervisor treatment. Python/Lua fixtures do not
 establish native transport, coal-network capability or campaign acceptance; see
 #100 and #92 for the remaining gates.
-
 See [negotiated atomic observation v2](ATOMIC_OBSERVATION.md) for the optional single-command read contract, query bounds and native qualification boundary.
 
 ### Bounded downstream solid investment (source-only follow-up)
