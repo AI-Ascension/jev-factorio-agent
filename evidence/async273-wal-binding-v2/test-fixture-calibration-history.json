@@ -1,0 +1,18 @@
+{
+  "status": "test-fixture-calibration-only",
+  "notes": [
+    {
+      "test": "test_operator_authorization_archives_terminal_wal_failure_before_new_probe",
+      "attempt": "initial fixture used an httpx.ReadTimeout and expected a terminal failed record",
+      "observed": "The WAL correctly recorded ambiguous because the timeout was after MAY_HAVE_BEEN_SENT.",
+      "disposition": "Changed the positive authorization fixture to a response-received HTTP 429 terminal rate-limit failure. Ambiguous requests remain protected by a separate no-supersession regression."
+    },
+    {
+      "test": "test_operator_authorization_archives_terminal_wal_failure_before_new_probe",
+      "attempt": "first response-received fixture asserted service_network for an HTTP 429",
+      "observed": "The actual persisted error category was rate_limit.",
+      "disposition": "Corrected the assertion to the transport's actual rate_limit classification. The final test passes."
+    }
+  ],
+  "classification": "These were test-fixture expectation errors, not production regressions. The earlier raw terminal-test output was replaced by the final pass log; the exact causes and corrected controls are preserved here."
+}
