@@ -152,10 +152,13 @@ def satisfied(effect: str, action: str, parameters: dict, snapshot) -> bool:
 
 
 def reserved(snapshot) -> dict:
-    """One carried payload is protected; never reserve predicted fish/craft yield."""
-    if 'launch_readiness' not in snapshot.factory or snapshot.victory is True: return {}
-    row = snapshot.factory.get('launch_readiness', {})
-    if payload(row.get('silo', {})): return {}
+    """Protect one payload only when its launch evidence is currently valid."""
+    if snapshot.victory is True: return {}
+    try:
+        row = evidence(snapshot)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return {}
+    if payload(row['silo']): return {}
     item = next((item for item in PAYLOADS if snapshot.inventory.get(item, 0) >= 1), None)
     return {item: 1} if item else {}
 
