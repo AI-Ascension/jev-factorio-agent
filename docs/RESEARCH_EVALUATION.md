@@ -71,6 +71,14 @@ interrupted by the supervisor may retain an unsealed, incomplete prefix.
 Evaluate each directory with the commands below; continuation invocations are
 not independent trials. Missing experiment provenance remains an exclusion.
 
+An output directory inside the active checkout must itself be covered by a Git
+ignore rule and contain no tracked files. The supervisor rejects the checkout,
+its ancestors, nonignored in-checkout paths, and paths whose ignore status cannot
+be checked. Put tracked research inputs outside the output directory; Git ignore
+rules do not hide tracked files from source-provenance snapshots. External output
+directories remain supported. These checks validate the output destination and
+do not turn source-snapshot failures into a clean revision.
+
 Legacy behavior and the existing API remain available:
 
 ```sh
