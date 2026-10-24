@@ -1,0 +1,12 @@
+{
+  "accepted": true,
+  "alias_dimension": "receipt",
+  "classification": "offline composed-loader producer-fixture evidence; no backend/native calls",
+  "coal_owner_receipt": "300:alpha:chest",
+  "families": [
+    "solid",
+    "coal"
+  ],
+  "output_buffers_schema": false,
+  "solid_owner_receipt": "300:alpha:chest"
+}
