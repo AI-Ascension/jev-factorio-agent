@@ -17,6 +17,125 @@ import requests
 from .operational_safety import SafetyStateError, atomic_json, read_json
 
 
+# Legacy checkpoint migration must know which concrete provider implementation
+# is the terminal health authority.  ``uses_http_provider``, a public ``state``
+# field, or an inspectable ``__dict__`` is not sufficient: an arbitrary adapter
+# can delegate through a closure to a different ProviderCircuit.  The supported
+# Jev implementations register their exact concrete types in jev_client.py.
+# This registry is intentionally private and has no plugin/duck-typed extension
+# path; adding an implementation requires a reviewed registration here.
+_SUPPORTED_PROVIDER_HEALTH_TERMINALS = {}
+
+
+def _register_builtin_provider_health_terminal(
+        client_type, *, kind, identity_fields=(), delegate_field=None,
+        delegate_kinds=(), mode="sync", requires_circuit=False):
+    if (not isinstance(client_type, type)
+            or client_type.__module__ != "jev_factorio.jev_client"
+            or not isinstance(kind, str) or not kind
+            or mode not in {"sync", "async"}
+            or type(requires_circuit) is not bool
+            or client_type in _SUPPORTED_PROVIDER_HEALTH_TERMINALS):
+        raise TypeError("Invalid or duplicate built-in provider health terminal")
+    namespace = type.__getattribute__(client_type, "__dict__")
+    evaluator = namespace.get("evaluate")
+    if not callable(evaluator):
+        raise TypeError("Provider health terminal needs its own evaluate implementation")
+    _SUPPORTED_PROVIDER_HEALTH_TERMINALS[client_type] = {
+        "kind": kind,
+        "evaluate": evaluator,
+        "identity_fields": tuple(identity_fields),
+        "delegate_field": delegate_field,
+        "delegate_kinds": frozenset(delegate_kinds),
+        "mode": mode,
+        "requires_circuit": requires_circuit,
+    }
+
+
+def supported_provider_health_terminal_contract(client, *, max_depth=4):
+    """Return the current immutable binding for a supported provider terminal.
+
+    Only exact Jev client implementations registered by ``jev_client`` qualify.
+    The returned tuple binds the object, concrete evaluator, current endpoint,
+    model, execution mode, and whether a durable circuit must be present. An
+    instance-level evaluator override, subclass, hidden adapter, or changed
+    nested async client returns ``None``. ``None`` itself is the explicit
+    no-provider case used by deterministic control.
+    """
+    if client is None:
+        return ("no-provider-v1",)
+    if type(max_depth) is not int or max_depth < 1:
+        return None
+
+    seen = set()
+
+    def bind(current, depth):
+        if depth > max_depth or id(current) in seen:
+            return None
+        seen.add(id(current))
+        current_type = type(current)
+        # Compare type identity without invoking a third-party metaclass's
+        # ``__hash__`` or ``__eq__`` during fail-closed classification.
+        spec = next((registered for registered_type, registered
+                     in _SUPPORTED_PROVIDER_HEALTH_TERMINALS.items()
+                     if current_type is registered_type), None)
+        if spec is None:
+            return None
+        try:
+            if (type.__getattribute__(current_type, "__getattribute__")
+                    is not object.__getattribute__):
+                return None
+            namespace = object.__getattribute__(current, "__dict__")
+            class_namespace = type.__getattribute__(current_type, "__dict__")
+        except (AttributeError, TypeError):
+            return None
+        if (type(namespace) is not dict
+                or "evaluate" in namespace
+                or class_namespace.get("evaluate") is not spec["evaluate"]):
+            return None
+
+        delegate_field = spec["delegate_field"]
+        if delegate_field is not None:
+            nested = namespace.get(delegate_field)
+            nested_binding = bind(nested, depth + 1)
+            if (nested_binding is None
+                    or nested_binding[0] not in spec["delegate_kinds"]):
+                return None
+            return (spec["kind"], id(current), id(spec["evaluate"]), nested_binding,
+                    spec["mode"], spec["requires_circuit"])
+
+        identity = []
+        if spec["requires_circuit"]:
+            http_marker = namespace.get(
+                "uses_http_provider", class_namespace.get("uses_http_provider"))
+            if http_marker is not True:
+                return None
+            identity.append(("uses_http_provider", True))
+        for name in spec["identity_fields"]:
+            value = namespace.get(name, class_namespace.get(name))
+            if type(value) is not str or not value:
+                return None
+            identity.append((name, value))
+        return (spec["kind"], id(current), id(spec["evaluate"]), tuple(identity),
+                spec["mode"], spec["requires_circuit"])
+
+    return bind(client, 1)
+
+
+def provider_health_terminal_contract_is_compatible(
+        contract, *, async_decisions, has_circuit):
+    """Check circuit and execution-mode requirements for migration authority."""
+    if contract == ("no-provider-v1",):
+        return (async_decisions is False and has_circuit is False)
+    if (type(contract) is not tuple or len(contract) != 6
+            or type(async_decisions) is not bool or type(has_circuit) is not bool):
+        return False
+    mode, requires_circuit = contract[4], contract[5]
+    return (mode == ("async" if async_decisions else "sync")
+            and type(requires_circuit) is bool
+            and (has_circuit or not requires_circuit))
+
+
 class ProviderPayloadError(ValueError):
     pass
 
