@@ -8,6 +8,7 @@ import requests
 
 from jev_factorio.backends.fle import FleBackend
 from jev_factorio.backends.native_factory import NativeFactory
+from jev_factorio.attempt_identity_archive import AttemptIdentityArchive, AttemptIdentityError
 from jev_factorio.memory import CampaignMemory
 from jev_factorio.skills import Plan, Step
 from jev_factorio.telemetry import error_code, make_attempt, phase, utc_now, validate_attempt
@@ -313,6 +314,19 @@ def test_partial_transfer_reconciliation_fails_closed_without_exact_evidence(
         receipt["role"] = "other"
     saved.save(tmp_path / "checkpoint.json")
 
+    if change == "returned_dispatch":
+        checkpoint_path = tmp_path / "checkpoint.json"
+        edited_checkpoint = checkpoint_path.read_bytes()
+        journal = AttemptIdentityArchive(checkpoint_path)
+        original_journal = journal.path.read_bytes()
+        calls_before = deepcopy(backend.calls)
+        with pytest.raises(AttemptIdentityError, match="does not match its durable attempt journal"):
+            controller(tmp_path, backend, resume=True, max_pending_polls=1)
+        assert checkpoint_path.read_bytes() == edited_checkpoint
+        assert journal.path.read_bytes() == original_journal
+        assert backend.calls == calls_before
+        return
+
     resumed = controller(tmp_path, backend, resume=True, max_pending_polls=1)
     result = resumed.step()
 
@@ -393,6 +407,19 @@ def test_prepared_transfer_recovery_fails_closed_without_all_native_evidence(
     else:
         backend.state.inventory["automation-science-pack"] = 19
     saved.save(tmp_path / "checkpoint.json")
+
+    if change in {"ambiguous_dispatch", "transfer_rpc_started"}:
+        checkpoint_path = tmp_path / "checkpoint.json"
+        edited_checkpoint = checkpoint_path.read_bytes()
+        journal = AttemptIdentityArchive(checkpoint_path)
+        original_journal = journal.path.read_bytes()
+        calls_before = deepcopy(backend.calls)
+        with pytest.raises(AttemptIdentityError, match="does not match its durable attempt journal"):
+            controller(tmp_path, backend, resume=True, max_pending_polls=1)
+        assert checkpoint_path.read_bytes() == edited_checkpoint
+        assert journal.path.read_bytes() == original_journal
+        assert backend.calls == calls_before
+        return
 
     resumed = controller(tmp_path, backend, resume=True, max_pending_polls=1)
     result = resumed.step()

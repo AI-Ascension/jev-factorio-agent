@@ -95,6 +95,10 @@ def _preflight_selected_checkpoint(path: Path, memory_type, target: str) -> byte
     finally:
         if archive_index is not None:
             archive_index.close()
+    from .attempt_identity_archive import AttemptIdentityArchive
+    attempt_archive = AttemptIdentityArchive(path)
+    with attempt_archive.owner():
+        attempt_archive.validate_capture(captured, memory_type, target)
     return captured
 
 

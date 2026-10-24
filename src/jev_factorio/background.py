@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
-from .controller import HierarchicalLoop
+from .controller import HierarchicalLoop, _attempt_identity_owned_step
 from .craft_jobs import (
     CraftActorObservationFailure, CraftJob, InvalidCraftEvidence,
 )
@@ -272,6 +272,7 @@ class BackgroundWorkLoop(HierarchicalLoop):
         )
         self._save()
 
+    @_attempt_identity_owned_step
     def _observe(self, stage="observe"):
         if self._save_poisoned:
             raise RuntimeError("Checkpoint persistence failed; reconstruct before continuing")
@@ -324,10 +325,14 @@ class BackgroundWorkLoop(HierarchicalLoop):
                         attempt is not None and attempt["id"] not in prior_verified_attempts
                     )
                     if attempt is not None:
-                        self.memory.attempt_outcomes.append({
+                        finished = {
                             **deepcopy(attempt), "outcome": "verified", "finished_tick": snapshot.tick,
                             "finished_at_utc": utc_now(), "latency_seconds": None,
-                        })
+                        }
+                        archive = getattr(self, "_attempt_identity_owner", None)
+                        if archive is not None:
+                            finished = archive.prepare_terminal(self.memory, finished)
+                        self.memory.attempt_outcomes.append(finished)
                         self.memory.attempt_outcomes = retain_latest_craft(self.memory.attempt_outcomes)
                     self.memory.background_attempt = None
                     self.memory.background_step = None
@@ -500,6 +505,9 @@ class BackgroundWorkLoop(HierarchicalLoop):
         if job is None:
             return False
         plan = Plan.from_dict(self.memory.active_plan)
+        archive = getattr(self, "_attempt_identity_owner", None)
+        if archive is not None:
+            archive.mark_background_transferred(self.memory, self.memory.attempt)
         self.memory.background_job = job.to_dict()
         self.memory.background_attempt = deepcopy(self.memory.attempt)
         self.memory.background_step = asdict(plan.steps[self.memory.step_index])
