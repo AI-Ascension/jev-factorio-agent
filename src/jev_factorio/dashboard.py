@@ -437,7 +437,17 @@ def attach(loop: Any, writer: EventWriter) -> None:
 
     loop.backend = BackendObserver(loop.backend)
     if loop.jev is not None:
-        loop.jev = ModelObserver(loop.jev)
+        original_model = loop.jev
+        observer = ModelObserver(original_model)
+        # Register only the exact observer just constructed here, and only
+        # with the supported controller type. The controller uses this pair
+        # to detect later observer/client replacement; it does not infer
+        # health authority through arbitrary wrappers.
+        from .controller import HierarchicalLoop
+        if isinstance(loop, HierarchicalLoop):
+            HierarchicalLoop._register_dashboard_model_observer(
+                loop, observer, original_model)
+        loop.jev = observer
 
     def decorate(name: str, wrapper: Callable) -> None:
         original = getattr(loop, name)

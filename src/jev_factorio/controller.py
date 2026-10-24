@@ -42,6 +42,10 @@ from .wait_record_codec import Encoder as WaitRecordEncoder, encode_line as enco
 
 MAX_ASYNC_CONTROLLER_WORKERS = 4
 MAX_ASYNC_RESOURCE_SLOTS = 128
+_LEGACY_ROCKET_CAPABILITY_BLOCK = (
+    "Missing full-game production/research/construction skills and "
+    "version-specific native rocket victory telemetry"
+)
 _ASYNC_RESOURCE_GUARD = threading.Lock()
 _ASYNC_RESOURCE_SLOTS: dict[tuple[str, str], dict] = {}
 _SYNC_RESOURCE_USERS: dict[tuple[str, str], int] = {}
@@ -412,6 +416,9 @@ class HierarchicalLoop(AgentLoop):
                     or not inspect.iscoroutinefunction(getattr(jev, "evaluate", None))):
                 raise ValueError(
                     "Async decisions require a checkpoint and an explicit async Jev provider")
+        elif isinstance(jev, ProviderCircuit):
+            if not self._typed_provider_circuit_chain(jev)[2]:
+                raise ValueError("Supplied provider circuit chain is cyclic or too deep")
         if not math.isfinite(confidence_floor) or not 0 <= confidence_floor <= 1:
             raise ValueError("Confidence floor must be in [0, 1]")
         if not math.isfinite(tick_seconds) or tick_seconds < 0:
@@ -542,10 +549,27 @@ class HierarchicalLoop(AgentLoop):
             self._async_wal = (
                 ProviderDecisionWAL.initialize(wal_path)
                 if not resume_controller else ProviderDecisionWAL(wal_path))
+        elif isinstance(jev, ProviderCircuit):
+            # A supplied circuit is already the health authority for its
+            # wrapped provider. Adding a fresh circuit here would let a healthy
+            # outer state hide an existing cooldown, exhausted budget, or
+            # in-flight reservation in the supplied circuit.
+            self.jev = jev
         elif jev is not None and getattr(jev, "uses_http_provider", False):
             self.jev = ProviderCircuit(jev, self._safety.directory / "provider.json"
                                       if self._safety else None)
             jev = self.jev
+        # Keep the typed health authority even when a supported observer later
+        # wraps ``self.jev`` (for example dashboard.attach's ModelObserver).
+        # The observer may delegate state but it is not itself a ProviderCircuit.
+        (self._provider_health_circuits,
+         self._provider_health_client,
+         self._provider_health_chain_valid) = self._typed_provider_circuit_chain(self.jev)
+        # dashboard.attach may register its exact observer and original model
+        # object below. Arbitrary wrappers are never inferred as this binding.
+        self._dashboard_provider_observer_binding = None
+        self._provider_health_circuit = (
+            self._provider_health_circuits[0] if self._provider_health_circuits else None)
         from .performance import PerformanceCounters
         from .planning.capacity_evidence import CapacityHistory
         self._performance = PerformanceCounters()
@@ -563,6 +587,178 @@ class HierarchicalLoop(AgentLoop):
                 and hasattr(backend, "enable_factory"):
             self.catalog = backend.enable_factory()
             self.max_pending_polls = max(self.max_pending_polls, 1800)
+
+    @staticmethod
+    def _typed_provider_circuit_chain(provider, *, max_depth: int = 8):
+        """Return only concrete nested health authorities, bounded and cycle-safe.
+
+        Arbitrary observers or wrappers are not treated as health evidence.
+        The provider circuits themselves are explicit typed authorities; their
+        client chain is traversed only while each node is a ProviderCircuit.
+        """
+        circuits = []
+        seen = set()
+        current = provider
+        while isinstance(current, ProviderCircuit):
+            if id(current) in seen or len(circuits) >= max_depth:
+                return tuple(circuits), None, False
+            seen.add(id(current))
+            circuits.append(current)
+            current = current.client
+        try:
+            hidden_circuit = any(
+                isinstance(value, ProviderCircuit)
+                for value in vars(current).values()
+            )
+        except (TypeError, AttributeError):
+            hidden_circuit = False
+        if hidden_circuit:
+            # A generic provider wrapper cannot replace an explicit circuit's
+            # health authority with its own state. We do not infer authority
+            # through arbitrary wrappers; simply fail closed for this narrow
+            # migration when one directly retains a typed circuit.
+            return tuple(circuits), None, False
+        return tuple(circuits), current, True
+
+    def _register_dashboard_model_observer(self, observer, original_model) -> None:
+        """Remember the exact supported dashboard wrapper created by attach().
+
+        This is a narrow registration hook, not generic wrapper discovery. The
+        dashboard passes both objects it just created; only the exact provider
+        object retained during construction can be registered.
+        """
+        circuits = self._provider_health_circuits
+        retained_root = circuits[0] if circuits else self._provider_health_client
+        if self.jev is not original_model or original_model is not retained_root:
+            return
+        try:
+            if vars(observer).get("model_client") is not original_model:
+                return
+            current_circuits, current_client, valid = (
+                self._typed_provider_circuit_chain(original_model))
+        except Exception:
+            return
+        if (not valid
+                or len(current_circuits) != len(circuits)
+                or any(current is not retained
+                       for current, retained in zip(current_circuits, circuits))
+                or current_client is not self._provider_health_client):
+            return
+        self._dashboard_provider_observer_binding = (observer, original_model)
+
+    def _retained_provider_root_is_active(self) -> bool:
+        circuits = self._provider_health_circuits
+        root = circuits[0] if circuits else self._provider_health_client
+        if self.jev is root:
+            return True
+        binding = self._dashboard_provider_observer_binding
+        if binding is None:
+            return False
+        observer, original_model = binding
+        if self.jev is not observer or original_model is not root:
+            return False
+        try:
+            # Read the real nested observer's instance storage directly. Do
+            # not invoke its __getattr__ or grant authority to arbitrary
+            # wrappers that merely expose a model_client-looking attribute.
+            return vars(observer).get("model_client") is original_model
+        except (TypeError, AttributeError):
+            return False
+
+    def _legacy_provider_health_ready(self) -> bool:
+        """Require the supplied durable provider-health authority to be current.
+
+        A checkpoint-bound legacy migration may not replace a supplied circuit
+        with a new healthy sidecar. All explicit circuits in a bounded chain
+        must remain healthy, identity-consistent, and free of a live or
+        unresolved request reservation.
+        """
+        if not self._provider_health_chain_valid:
+            return False
+        circuits = self._provider_health_circuits
+        if not self._retained_provider_root_is_active():
+            return False
+        if not circuits:
+            return not isinstance(self._provider_health_client, ProviderCircuit)
+
+        # ProviderCircuit.client is intentionally public and mutable. A cache
+        # captured during construction is not enough to authorize a later
+        # migration: a caller could replace a healthy circuit's client (or add
+        # a nested circuit) while the cached sidecar still describes the old
+        # provider. Rewalk the current bounded typed chain from the retained
+        # authority and require every circuit and the terminal client to be the
+        # exact objects that were admitted at construction. This leaves circuit
+        # health, budgets, reservations, and sidecars untouched.
+        try:
+            current_circuits, current_client, current_chain_valid = (
+                self._typed_provider_circuit_chain(circuits[0]))
+        except Exception:
+            return False
+        if (not current_chain_valid
+                or len(current_circuits) != len(circuits)
+                or any(current is not retained
+                       for current, retained in zip(current_circuits, circuits))
+                or current_client is not self._provider_health_client):
+            return False
+
+        if self.checkpoint is None or self._safety is None:
+            return False
+        expected_path = self._safety.directory / "provider.json"
+        try:
+            actual_path = circuits[0].path
+            if (actual_path is None
+                    or Path(actual_path).resolve() != expected_path.resolve()):
+                return False
+            client = current_client
+            identity_input = json.dumps([
+                getattr(client, "base_url", getattr(client, "url", "")),
+                getattr(client, "model", ""),
+            ])
+            expected_identity = hashlib.sha256(identity_input.encode()).hexdigest()
+        except Exception:
+            return False
+
+        for circuit in circuits:
+            state = circuit.state
+            if (type(state) is not dict
+                    or circuit.identity != expected_identity
+                    or state.get("identity") != expected_identity
+                    or state.get("phase") != "healthy"
+                    or "in_flight" not in state
+                    or state["in_flight"] is not None):
+                return False
+            try:
+                circuit_path = circuit.path
+                if circuit_path is None:
+                    return False
+                persisted = self._read_provider_health_sidecar(circuit, circuit_path)
+                if persisted is None:
+                    if state != circuit._initial_state:
+                        return False
+                elif persisted != state:
+                    return False
+            except Exception:
+                return False
+        return True
+
+    @staticmethod
+    def _read_provider_health_sidecar(circuit, path):
+        """Read a circuit sidecar without reconciling or rewriting its state."""
+        from .operational_safety import read_json
+
+        persisted = read_json(path)
+        if persisted is None:
+            return None
+        circuit._validate(persisted)
+        # Match ProviderCircuit's read-only compatibility normalization for
+        # older schema-1 sidecars that predate explicit request reservations.
+        persisted.setdefault("in_flight", None)
+        persisted.setdefault("budget_category", persisted.get("category"))
+        persisted.setdefault(
+            "budget_limit",
+            circuit._limit(persisted["category"]) if persisted.get("category") else None,
+        )
+        return persisted
 
     async def step_async(self) -> dict:
         """Run one explicitly enabled durable async-provider controller step.
@@ -2025,6 +2221,87 @@ class HierarchicalLoop(AgentLoop):
         return ((getattr(memory, "background_job", None) is None)
                 != (getattr(memory, "background_attempt", None) is None))
 
+    def _legacy_rocket_capability_resume_candidate(self) -> bool:
+        """Recognize only the idle historical rocket block with current typed capability.
+
+        A restored blocked checkpoint is otherwise terminal. This narrow case
+        may pass through the ordinary current planner only after the existing
+        checkpoint/source/observation checks, with the normal safety admission
+        still ahead of planning. Unresolved or separately owned work stays blocked.
+        """
+        from .planning.catalog import Catalog
+
+        memory = self.memory
+        if (not isinstance(memory, CampaignMemory)
+                or not isinstance(self.catalog, Catalog)
+                or not self.resume_controller or self.checkpoint is None
+                or memory.version != 2
+                or memory.status != "blocked"
+                or memory.reason != _LEGACY_ROCKET_CAPABILITY_BLOCK
+                or memory.target != "rocket_launch"
+                or memory.active_goal != "rocket_launch"
+                or "rocket_launch" in memory.completed_goals
+                or not {"stockpile_fuel", "bootstrap_mining"} <= set(memory.completed_goals)
+                or memory.pending is not None or memory.active_plan is not None
+                or memory.attempt is not None or memory.transfer_recovery is not None
+                or memory.async_decision is not None or memory.capital_investment is not None
+                or memory.blocked_recovery is not None
+                or memory.blocked_recovery_archive is not None
+                or memory.blocked_reevaluations
+                or self._reevaluate_blocked_once or self.persist_recoverable_blocks
+                or self._persistence_failed or self._capital_fault
+                or self._persistent_idle_exhausted):
+            return False
+
+        # Keep every paid/background/extension obligation outside this one
+        # capability migration. Empty schema bindings remain attached and are
+        # reconciled against the fresh observation by the normal path.
+        if memory.reservations:
+            return False
+        connector = memory.connector_ownership
+        if connector is not None and connector.get("routes"):
+            return False
+        if any(getattr(memory, name, None) for name in (
+                "background_job", "background_attempt", "background_step",
+                "output_commitments", "input_commitments", "outpost_commitments",
+                "successor_projects", "successor_receipts", "solid_intents", "solid_epoch",
+                "solid_commitments", "solid_funding", "coal_targets", "coal_epoch",
+                "coal_commitments", "coal_funding")):
+            return False
+        if any(row.get("kind") == "legacy_capability_block_resumed" for row in memory.history):
+            return False
+        # The transition event must not evict a retained ordinary history row.
+        if sum(row.get("kind") != "paid_duplicate_selection_reconciled"
+               for row in memory.history) >= 64:
+            return False
+        if not self._legacy_provider_health_ready():
+            return False
+        return True
+
+    def _record_legacy_rocket_capability_resume(self, snapshot: GameSnapshot,
+                                                plans: list[Plan]) -> None:
+        """Persist current-planner qualification before selection or dispatch."""
+        if not self._legacy_rocket_capability_resume_candidate():
+            return
+        prior_status, prior_reason = self.memory.status, self.memory.reason
+        prior_history = deepcopy(self.memory.history)
+        self.memory.status, self.memory.reason = "running", ""
+        try:
+            self.memory.event(
+                "legacy_capability_block_resumed",
+                schema=1,
+                goal="rocket_launch",
+                prior_reason=_LEGACY_ROCKET_CAPABILITY_BLOCK,
+                catalog_version=self.catalog.version,
+                candidate_plan_ids=[plan.id for plan in plans],
+                tick=snapshot.tick,
+            )
+            self._save()
+        except BaseException:
+            self.memory.status, self.memory.reason = prior_status, prior_reason
+            self.memory.history = prior_history
+            raise
+
     def _persistent_block_active(self) -> bool:
         from .blocked_persistence import is_recoverable_reason
         memory = self.memory
@@ -2932,12 +3209,12 @@ class HierarchicalLoop(AgentLoop):
                 "decision": asdict(decision) if decision else None,
                 "model_call": decision is not None and decision.model_called,
                 "requested_model": (async_result.get("requested_model") if async_result else
-                                    getattr(self.jev, "model", None)),
+                                    self._provider_record_attribute("model")),
                 "resolved_model": (async_result.get("resolved_model") if async_result else
-                                   getattr(self.jev, "last_model", None)
+                                   self._provider_record_attribute("last_model")
                                    if decision and decision.model_called else None),
                 "usage": (async_result.get("usage") if async_result else
-                          getattr(self.jev, "last_usage", None)
+                          self._provider_record_attribute("last_usage")
                           if decision and decision.model_called else None),
                 "pending": deepcopy(self.memory.pending), "history": deepcopy(self.memory.history[-8:]),
                 "process_id": self._process_id, "recorded_at_utc": utc_now(),
@@ -2994,6 +3271,26 @@ class HierarchicalLoop(AgentLoop):
         with span("record_console"):
             print(f"[t={before.tick}] {self.memory.status}: {action} -> {outcome}", flush=True)
         return record
+
+    def _provider_record_attribute(self, name: str):
+        """Read model metadata only from the still-bound typed provider chain."""
+        circuits = self._provider_health_circuits
+        if not self._retained_provider_root_is_active():
+            return None
+        if not circuits:
+            return getattr(self._provider_health_client, name, None)
+        current_circuits, current_client, current_chain_valid = (
+            self._typed_provider_circuit_chain(circuits[0]))
+        if (not current_chain_valid
+                or len(current_circuits) != len(circuits)
+                or any(current is not retained
+                       for current, retained in zip(current_circuits, circuits))
+                or current_client is not self._provider_health_client):
+            # A cycle, overlong chain, or post-construction replacement is not
+            # a source for trustworthy model metadata. The rejection record is
+            # still writable and carries no fabricated provider identity.
+            return None
+        return getattr(current_client, name, None)
 
     def _model_history(self) -> list:
         if not self.persist_recoverable_blocks:
@@ -3831,7 +4128,8 @@ class HierarchicalLoop(AgentLoop):
                 self._consume_blocked_reevaluation(snapshot)
         if self.memory.status == "uncertain" and self.memory.pending:
             return self._verify_pending(snapshot)
-        if self.terminal and not blocked_reevaluation:
+        legacy_capability_resume = self._legacy_rocket_capability_resume_candidate()
+        if self.terminal and not blocked_reevaluation and not legacy_capability_resume:
             return self._record(snapshot, "observe", self.memory.reason)
         # Resolve in-flight work before processing model requests or goal changes.
         if self.memory.pending:
@@ -3844,7 +4142,7 @@ class HierarchicalLoop(AgentLoop):
         if self.terminal and not (
             blocked_reevaluation and self.memory.status == "blocked"
             and self.memory.reason == blocked_reevaluation_reason
-        ):
+        ) and not self._legacy_rocket_capability_resume_candidate():
             return self._record(snapshot, "observe", self.memory.reason, verified=True)
         if self.memory.active_plan is None:
             # The checkpoint intentionally remains blocked until useful work
@@ -3934,6 +4232,8 @@ class HierarchicalLoop(AgentLoop):
                 self._planning_diagnostics["ranked_plan_ids"] = [p.id for p in plans]
                 self._planning_diagnostics["candidate_evidence"] = deepcopy(
                     self._selection_support["candidate_evidence"])
+            if plans:
+                self._record_legacy_rocket_capability_resume(snapshot, plans)
             if getattr(self, "_solid_science_policy", False):
                 # Capture the exact executable frontier independently of the
                 # later selected-plan event. This diagnostic is never a prompt
