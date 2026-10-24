@@ -211,7 +211,7 @@ def corridor_reservations_clear(cell, rows) -> bool:
     return True
 
 
-def sources(snapshot) -> dict:
+def _sources(snapshot, *, completion: bool) -> dict:
     data = snapshot.factory.get("coal_supply")
     base_fields = {"protocol", "session_id", "tick", "actor_index", "surface_index", "force_index", "targets", "committed", "sources", "reason"}
     if not isinstance(data, dict) or type(data.get("protocol")) is not int or data["protocol"] not in (1, 2):
@@ -260,8 +260,13 @@ def sources(snapshot) -> dict:
         if any(_overlap(area, prior) for prior in areas):
             raise ValueError("Coal branches share a resource accounting area")
         areas.append(area)
-        if row["flow"] and row["flow"]["last_tick"] != snapshot.tick:
-            raise ValueError("Coal flow does not belong to this observation")
+        if row["flow"]:
+            flow_tick = row["flow"]["last_tick"]
+            if completion:
+                if flow_tick > snapshot.tick:
+                    raise ValueError("Coal flow evidence is from the future")
+            elif flow_tick != snapshot.tick:
+                raise ValueError("Coal flow does not belong to this observation")
     for cell in epoch.get("routes", {}).values():
         solid.validate_row(cell, cell["route"])
         if (cell["state"] != "proposed" or cell["pending"]) and not corridor_reservations_clear(cell, rows):
@@ -269,6 +274,16 @@ def sources(snapshot) -> dict:
     if len(layouts) > 1:
         raise ValueError("Coal bundle mixes source generations")
     return rows
+
+
+def sources(snapshot) -> dict:
+    """Validate source telemetry for ordinary exact-tick controller use."""
+    return _sources(snapshot, completion=False)
+
+
+def completion_sources(snapshot) -> dict:
+    """Validate retained paid sources for read-only completion preflight."""
+    return _sources(snapshot, completion=True)
 
 
 def private_source_roles(snapshot) -> frozenset[str]:
@@ -327,8 +342,9 @@ def current(row, snapshot) -> bool:
     return True
 
 
-def route_for(row, snapshot):
-    matches = [r for r in solid.routes(snapshot).values()
+def route_for(row, snapshot, *, completion: bool = False):
+    route_rows = solid.completion_routes(snapshot) if completion else solid.routes(snapshot)
+    matches = [r for r in route_rows.values()
                if r["source"]["role"] == role(row["target"]["role"], "chest")]
     if not matches:
         return None
@@ -439,23 +455,34 @@ def permits(action, parameters, snapshot) -> bool:
         return False
 
 
-def flow_complete(snapshot) -> bool:
+def _flow_complete(snapshot, *, completion: bool) -> bool:
     try:
-        rows = sources(snapshot)
+        rows = completion_sources(snapshot) if completion else sources(snapshot)
         if len(rows) < 2:
             return False
         for row in rows.values():
-            f = row["flow"]; route = route_for(row, snapshot)
+            f = row["flow"]; route = route_for(row, snapshot, completion=completion)
             if (not current(row, snapshot) or not row["power"]["energized"] or row["reason"] == "no_power"
                     or row["state"] not in {"ready", "depleted"} or not f or not route
                     or f["route_layout"] != route["layout"] or not route["topology"]
+                    or f["last_tick"] > snapshot.tick
                     or f["last_tick"] - f["first_tick"] < 120 or f["positive_samples"] < 3
+                    or f["last_tick"]-f["last_positive_tick"] > solid.MAX_FLOW_IDLE_TICKS
                     or snapshot.tick - f["last_positive_tick"] > solid.MAX_FLOW_IDLE_TICKS
                     or f["delivered_lower"] < 3 or f["burned_lower_joules"] <= 0):
                 return False
         return True
     except (ValueError, KeyError, TypeError, AttributeError):
         return False
+
+
+def flow_complete(snapshot) -> bool:
+    return _flow_complete(snapshot, completion=False)
+
+
+def completion_flow_complete(snapshot) -> bool:
+    """Completion-only flow validator; ordinary controller checks stay exact-tick."""
+    return _flow_complete(snapshot, completion=True)
 
 
 def commitment(row) -> dict:
@@ -478,10 +505,10 @@ def validate_commitment(saved, target: str) -> None:
                   "route": "", "flow": {}, "reason": "building", "pending": {}, "manual_pending": {}}, target)
 
 
-def binds_solid_flow(route: dict, snapshot) -> bool:
+def binds_solid_flow(route: dict, snapshot, *, completion: bool = False) -> bool:
     """Cross-bind mined-flow telemetry without recursively calling solid.routes."""
     try:
-        rows = sources(snapshot)
+        rows = completion_sources(snapshot) if completion else sources(snapshot)
         row = rows[route["target"]["role"]]
         f, g = row["flow"], route["flow"]
         return bool(current(row, snapshot) and f and row["route"] == route["route"]
