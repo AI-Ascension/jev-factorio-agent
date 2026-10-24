@@ -54,6 +54,18 @@ LEGACY_MANUAL_CYCLE_PROFILE = 'e759-observation-v2-water-origin-v4-manual-cycle-
 MANUAL_CYCLE_PROFILE = 'e759-observation-v2-water-origin-v4-manual-cycle-v5-connector-observer-v1'
 CLOSED_WORLD_PROFILE = 'e759-observation-v2-water-origin-v4-manual-cycle-v6-connector-observer-v1'
 CONNECTOR_OBSERVER_WITNESS_NAME = 'native-connector-observer-v1.witness.jsonl'
+LAUNCH_RECONCILIATION_PROTOCOL = 1
+
+_RETAINED_PROFILES = {
+    LEGACY_OBSERVATION_PROFILE,
+    EXPANDED_OBSERVATION_PROFILE,
+    WATER_ORIGIN_OBSERVATION_PROFILE,
+    LEGACY_MANUAL_CYCLE_PROFILE,
+    MANUAL_CYCLE_PROFILE,
+    CLOSED_WORLD_PROFILE,
+    BOOTSTRAP_PROFILE,
+    MANUAL_CYCLE_BOOTSTRAP_PROFILE,
+}
 
 
 def manual_journal_sha256():
@@ -74,6 +86,173 @@ def connector_ownership_sha256():
 def connector_observer_bridge_sha256():
     return hashlib.sha256(files('jev_factorio').joinpath(
         'lua/connector_observer_bridge_v1.lua').read_bytes()).hexdigest()
+
+
+def launch_readiness_sha256():
+    """Return the exact current launch asset digest without changing legacy pins."""
+    return hashlib.sha256(_asset_source('launch_readiness').read_bytes()).hexdigest()
+
+
+def launch_reconciliation_available(attachment, proof):
+    """Whether a qualified attachment proves the guarded module is actually loaded.
+
+    Existing legacy attachments remain usable for unrelated capabilities. A
+    launch or paid payload-load operation additionally needs the in-memory
+    version marker and the exact current launch asset digest in its source-bound
+    installation manifest.
+    """
+    if (not isinstance(proof, dict)
+            or set(proof) != {'protocol', 'session_id', 'actor_unit', 'profile', 'asset_sha256'}
+            or type(proof.get('protocol')) is not int
+            or proof['protocol'] != LAUNCH_RECONCILIATION_PROTOCOL
+            or not isinstance(proof.get('session_id'), str) or not proof['session_id']
+            or type(proof.get('actor_unit')) is not int or proof['actor_unit'] < 1
+            or proof.get('asset_sha256') != launch_readiness_sha256()):
+        return False
+    profile = proof.get('profile')
+    if profile is False:
+        if attachment is not None:
+            from .native_current_attachment import is_supported_direct_installation
+            if not is_supported_direct_installation(attachment):
+                return False
+    elif type(profile) is not str or profile not in _RETAINED_PROFILES:
+        return False
+    if attachment is None:
+        return profile is False
+    if (not isinstance(attachment, dict) or attachment.get('qualified') is not True
+            or type(attachment.get('session_id')) is not str
+            or type(attachment.get('actor_unit')) is not int
+            or attachment.get('session_id') != proof['session_id']
+            or attachment.get('actor_unit') != proof['actor_unit']):
+        return False
+    modules = attachment.get('modules')
+    native = attachment.get('native_installation')
+    if (not isinstance(modules, dict) or modules.get('launch_readiness') is not True
+            or not isinstance(native, dict)
+            or type(native.get('actor_unit')) is not int
+            or type(native.get('session_id')) is not str
+            or native.get('schema') != NATIVE_SCHEMA
+            or native.get('session_id') != proof['session_id']
+            or native.get('actor_unit') != proof['actor_unit']
+            or native.get('profile') != profile
+            or not isinstance(native.get('assets'), dict)
+            or native['assets'].get('launch_readiness') != proof['asset_sha256']):
+        return False
+    if profile is False:
+        from .native_current_attachment import is_supported_direct_installation
+        return is_supported_direct_installation(attachment)
+    return profile in _RETAINED_PROFILES
+
+
+def require_launch_reconciliation(attachment, proof):
+    if not launch_reconciliation_available(attachment, proof):
+        raise RuntimeError(
+            'Launch reconciliation module is not qualified for this retained attachment; '
+            'reconcile the installed launch asset before launch or payload loading'
+        )
+    return True
+
+
+def launch_reconciliation_call_guard(proof):
+    """Build an in-command guard so proof cannot go stale before a launch call."""
+    if (not isinstance(proof, dict)
+            or set(proof) != {'protocol', 'session_id', 'actor_unit', 'profile', 'asset_sha256'}
+            or type(proof.get('protocol')) is not int
+            or proof['protocol'] != LAUNCH_RECONCILIATION_PROTOCOL
+            or not isinstance(proof.get('session_id'), str) or not proof['session_id']
+            or type(proof.get('actor_unit')) is not int or proof['actor_unit'] < 1
+            or proof.get('asset_sha256') != launch_readiness_sha256()
+            or (proof.get('profile') is not False
+                and (type(proof.get('profile')) is not str
+                     or proof['profile'] not in _RETAINED_PROFILES))):
+        raise RuntimeError('Launch reconciliation proof is malformed or stale')
+    profile = proof['profile']
+    profile_test = ('(n.profile or false)==false' if profile is False
+                    else 'n.profile==' + json.dumps(profile))
+    return (
+        'local rt=assert(jev_fle_runtime);local n=assert(rt.native_installation);'
+        'local a=assert(rt.agent_characters and rt.agent_characters[1]);'
+        'local r=assert(storage.launch_readiness);'
+        'local q=assert(rt.launch_reconciliation);'
+        'assert(q.protocol==' + str(LAUNCH_RECONCILIATION_PROTOCOL) + ' '
+        'and type(q.verify)=="function" and q.verify()==true);'
+        'assert(r.load_reconciliation_protocol==' + str(LAUNCH_RECONCILIATION_PROTOCOL) + ' '
+        'and rt.campaign==storage.campaign);'
+        'assert(rt.jev_session_id==' + json.dumps(proof['session_id']) + ' '
+        'and n.session_id==' + json.dumps(proof['session_id']) + ' '
+        'and a.valid and a.unit_number==' + str(proof['actor_unit']) + ' '
+        'and n.actor_unit==' + str(proof['actor_unit']) + ' '
+        'and n.schema==' + json.dumps(NATIVE_SCHEMA) + ' '
+        'and ' + profile_test + ');'
+        'assert(type(n.assets)=="table" and n.assets.launch_readiness=='
+        + json.dumps(proof['asset_sha256']) + ');'
+    )
+
+
+def prepare_launch_reconciliation_upgrade_command(attachment):
+    """Prepare, but never send, a one-use exact-profile legacy module upgrade.
+
+    The caller must separately authorize and execute the returned native
+    command, then perform normal source-bound readback before constructing an
+    adapter. No launch, transfer, receipt, attempt, or inventory operation is
+    performed by preparing this text.
+    """
+    if (not isinstance(attachment, dict) or attachment.get('qualified') is not True
+            or not isinstance(attachment.get('modules'), dict)):
+        raise RuntimeError('Launch asset upgrade requires a qualified retained attachment')
+    native = attachment.get('native_installation')
+    profile = native.get('profile') if isinstance(native, dict) else None
+    session_id = attachment.get('session_id')
+    actor_unit = attachment.get('actor_unit')
+    if (type(profile) is not str or profile not in _RETAINED_PROFILES
+            or not isinstance(native, dict)
+            or native.get('schema') != NATIVE_SCHEMA
+            or type(native.get('session_id')) is not str
+            or type(native.get('actor_unit')) is not int
+            or native.get('session_id') != session_id
+            or native.get('actor_unit') != actor_unit
+            or not isinstance(session_id, str) or not session_id
+            or type(actor_unit) is not int or actor_unit < 1
+            or attachment.get('modules', {}).get('launch_readiness') is not True
+            or not isinstance(native.get('assets'), dict)
+            or native['assets'].get('launch_readiness') != PINNED_ASSETS['launch_readiness']):
+        raise RuntimeError('Launch asset upgrade does not match a supported pinned legacy attachment')
+
+    new_asset = launch_readiness_sha256()
+    source = _asset_source('launch_readiness').read_text()
+    session_literal = json.dumps(session_id)
+    profile_literal = json.dumps(profile)
+    old_hash_literal = json.dumps(PINNED_ASSETS['launch_readiness'])
+    new_hash_literal = json.dumps(new_asset)
+    actor_literal = str(actor_unit)
+    preflight = (
+        'local rt=assert(jev_fle_runtime); local n=assert(rt.native_installation); '
+        'local a=assert(rt.agent_characters and rt.agent_characters[1]); '
+        'local old=assert(storage.launch_readiness); '
+        'local attempts=assert(old.attempts); local receipts=assert(old.receipts); '
+        'assert(rt.jev_session_id==' + session_literal + ' and a.valid '
+        'and a.unit_number==' + actor_literal + '); '
+        'assert(n.schema==' + json.dumps(NATIVE_SCHEMA) + ' and '
+        'n.session_id==' + session_literal + ' and n.actor_unit==' + actor_literal + '); '
+        'assert(n.profile==' + profile_literal + ' and '
+        'n.assets.launch_readiness==' + old_hash_literal + '); '
+        'assert(old.schema==1 and type(attempts)=="table" and type(receipts)=="table" '
+        'and (old.load_reconciliation_protocol==nil or old.load_reconciliation_protocol==false)); '
+        'assert(rt.launch_reconciliation==nil); '
+    )
+    completion = (
+        'assert(storage.launch_readiness==old and old.attempts==attempts '
+        'and old.receipts==receipts); '
+        'assert(old.load_reconciliation_protocol==' + str(LAUNCH_RECONCILIATION_PROTOCOL) + '); '
+        'assert(type(rt.launch_reconciliation)=="table" and '
+        'rt.launch_reconciliation.protocol==' + str(LAUNCH_RECONCILIATION_PROTOCOL) + ' '
+        'and type(rt.launch_reconciliation.verify)=="function" '
+        'and rt.launch_reconciliation.verify()==true); '
+        'assert(n.assets.launch_readiness==' + old_hash_literal + '); '
+        'n.assets.launch_readiness=' + new_hash_literal + '; '
+        'assert(n.assets.launch_readiness==' + new_hash_literal + '); '
+    )
+    return 'do\n' + preflight + '\n' + source + '\n' + completion + '\nend'
 
 
 def connector_snapshot_sha256(snapshot: dict) -> str:
@@ -279,6 +458,69 @@ def _asset_source(name, profile=False):
                  else WATER_ORIGIN_OBSERVATION_ASSET)
         return files('jev_factorio').joinpath('lua/' + asset)
     return files('jev_factorio').joinpath('lua/' + name + '.lua')
+
+
+def _retained_profile_asset_matches(name, value, profile):
+    """Keep the original profile pins while recognizing only the new launch asset."""
+    if name == 'launch_readiness':
+        return (type(value) is str
+                and value in {PINNED_ASSETS[name], launch_readiness_sha256()})
+    if profile in {LEGACY_OBSERVATION_PROFILE, EXPANDED_OBSERVATION_PROFILE,
+                   WATER_ORIGIN_OBSERVATION_PROFILE}:
+        expected = {
+            LEGACY_OBSERVATION_PROFILE: LEGACY_OBSERVATION_SHA256,
+            EXPANDED_OBSERVATION_PROFILE: EXPANDED_OBSERVATION_SHA256,
+            WATER_ORIGIN_OBSERVATION_PROFILE: WATER_ORIGIN_OBSERVATION_SHA256,
+        }[profile] if name == 'observation_v2' else PINNED_ASSETS.get(name)
+    elif profile in {MANUAL_CYCLE_PROFILE, MANUAL_CYCLE_BOOTSTRAP_PROFILE}:
+        expected = (
+            WATER_ORIGIN_OBSERVATION_SHA256 if name == 'observation_v2'
+            else connector_ownership_sha256() if name == 'connector_ownership'
+            else manual_journal_sha256() if name == 'coal_manual_journal_v1'
+            else connector_observer_bridge_sha256() if name == 'connector_observer_bridge_v1'
+            else hashlib.sha256(_asset_source(BOOTSTRAP_MODULE).read_bytes()).hexdigest()
+                 if name == BOOTSTRAP_MODULE and profile == MANUAL_CYCLE_BOOTSTRAP_PROFILE
+            else PINNED_ASSETS.get(name)
+        )
+    elif profile == LEGACY_MANUAL_CYCLE_PROFILE:
+        expected = (
+            WATER_ORIGIN_OBSERVATION_SHA256 if name == 'observation_v2'
+            else connector_ownership_sha256() if name == 'connector_ownership'
+            else manual_journal_sha256() if name == 'coal_manual_journal_v1'
+            else PINNED_ASSETS.get(name)
+        )
+    elif profile in {CLOSED_WORLD_PROFILE, BOOTSTRAP_PROFILE}:
+        expected = (
+            WATER_ORIGIN_OBSERVATION_SHA256 if name == 'observation_v2'
+            else connector_ownership_sha256() if name == 'connector_ownership'
+            else manual_journal_sha256() if name == 'coal_manual_journal_v1'
+            else cycle_journal_sha256() if name == 'coal_manual_cycle_v2'
+            else connector_observer_bridge_sha256() if name == 'connector_observer_bridge_v1'
+            else hashlib.sha256(_asset_source(BOOTSTRAP_MODULE).read_bytes()).hexdigest()
+                 if name == BOOTSTRAP_MODULE and profile == BOOTSTRAP_PROFILE
+            else PINNED_ASSETS.get(name)
+        )
+    else:
+        expected = PINNED_ASSETS.get(name)
+    return value == expected
+
+
+LAUNCH_RECONCILIATION_PROBE = r'''local rt=jev_fle_runtime
+local capability=rt and rt.launch_reconciliation
+local n=rt and rt.native_installation
+local a=rt and rt.agent_characters and rt.agent_characters[1]
+local loaded=false
+if capability and capability.protocol==1 and type(capability.verify)=="function" then
+    local ok,value=pcall(capability.verify)
+    loaded=ok and value==true
+end
+rcon.print(helpers.table_to_json({
+    protocol=loaded and capability.protocol or false,
+    session_id=rt and rt.jev_session_id or false,
+    actor_unit=a and a.unit_number or false,
+    profile=n and n.profile or false,
+    asset_sha256=n and n.assets and n.assets.launch_readiness or false
+}))'''
 
 
 PROBE = r'''local rt=jev_fle_runtime
@@ -563,8 +805,7 @@ def readback(client, *, receipt_path=None, connector_witness_path=None,
                     or result['modules']['successors']
                     or native['assets'].get('factory') != PINNED_ASSETS['factory']
                     or native['assets'].get('observation_v2') != observation_hash
-                    or any(value != (observation_hash if name == 'observation_v2'
-                                     else PINNED_ASSETS.get(name))
+                    or any(not _retained_profile_asset_matches(name, value, profile)
                            for name, value in native['assets'].items())):
                 raise RuntimeError('Observation migration profile requires reconciliation')
         elif profile in {MANUAL_CYCLE_PROFILE, MANUAL_CYCLE_BOOTSTRAP_PROFILE}:
@@ -580,13 +821,7 @@ def readback(client, *, receipt_path=None, connector_witness_path=None,
                     or native['assets'].get('connector_ownership') != connector_ownership_sha256()
                     or native['assets'].get('coal_manual_journal_v1') != manual_journal_sha256()
                     or native['assets'].get('connector_observer_bridge_v1') != connector_observer_bridge_sha256()
-                    or any(value != (WATER_ORIGIN_OBSERVATION_SHA256 if name == 'observation_v2'
-                                     else connector_ownership_sha256() if name == 'connector_ownership'
-                                     else manual_journal_sha256() if name == 'coal_manual_journal_v1'
-                                     else connector_observer_bridge_sha256() if name == 'connector_observer_bridge_v1'
-                                     else hashlib.sha256(_asset_source(BOOTSTRAP_MODULE).read_bytes()).hexdigest()
-                                         if name == BOOTSTRAP_MODULE and profile == MANUAL_CYCLE_BOOTSTRAP_PROFILE
-                                     else PINNED_ASSETS.get(name))
+                    or any(not _retained_profile_asset_matches(name, value, profile)
                            for name, value in native['assets'].items())):
                 raise RuntimeError('Manual-cycle migration profile requires reconciliation')
         elif profile == LEGACY_MANUAL_CYCLE_PROFILE:
@@ -601,10 +836,7 @@ def readback(client, *, receipt_path=None, connector_witness_path=None,
                     or native['assets'].get('observation_v2') != WATER_ORIGIN_OBSERVATION_SHA256
                     or native['assets'].get('connector_ownership') != connector_ownership_sha256()
                     or native['assets'].get('coal_manual_journal_v1') != manual_journal_sha256()
-                    or any(value != (WATER_ORIGIN_OBSERVATION_SHA256 if name == 'observation_v2'
-                                     else connector_ownership_sha256() if name == 'connector_ownership'
-                                     else manual_journal_sha256() if name == 'coal_manual_journal_v1'
-                                     else PINNED_ASSETS.get(name))
+                    or any(not _retained_profile_asset_matches(name, value, profile)
                            for name, value in native['assets'].items())):
                 raise RuntimeError('Legacy v5 observer requires the one-use repair migration')
         elif profile in {CLOSED_WORLD_PROFILE, BOOTSTRAP_PROFILE}:
@@ -621,14 +853,7 @@ def readback(client, *, receipt_path=None, connector_witness_path=None,
                     or native['assets'].get('coal_manual_journal_v1') != manual_journal_sha256()
                     or native['assets'].get('coal_manual_cycle_v2') != cycle_journal_sha256()
                     or native['assets'].get('connector_observer_bridge_v1') != connector_observer_bridge_sha256()
-                    or any(value != (WATER_ORIGIN_OBSERVATION_SHA256 if name == 'observation_v2'
-                                     else connector_ownership_sha256() if name == 'connector_ownership'
-                                     else manual_journal_sha256() if name == 'coal_manual_journal_v1'
-                                     else cycle_journal_sha256() if name == 'coal_manual_cycle_v2'
-                                     else connector_observer_bridge_sha256() if name == 'connector_observer_bridge_v1'
-                                     else hashlib.sha256(_asset_source(BOOTSTRAP_MODULE).read_bytes()).hexdigest()
-                                         if name == BOOTSTRAP_MODULE and profile == BOOTSTRAP_PROFILE
-                                     else PINNED_ASSETS.get(name))
+                    or any(not _retained_profile_asset_matches(name, value, profile)
                            for name, value in native['assets'].items())):
                 raise RuntimeError('Closed-world migration profile requires reconciliation')
         elif profile is not False:
@@ -706,16 +931,16 @@ def require_asset(attachment, name):
     asset = _asset_source(name, profile).read_bytes()
     expected = (manifest['assets'].get(name) if isinstance(manifest, dict)
                 else PINNED_ASSETS.get(name))
-    if (isinstance(manifest, dict)
-                and profile in {LEGACY_OBSERVATION_PROFILE, EXPANDED_OBSERVATION_PROFILE,
-                                WATER_ORIGIN_OBSERVATION_PROFILE, MANUAL_CYCLE_PROFILE,
-                                LEGACY_MANUAL_CYCLE_PROFILE,
-                                 CLOSED_WORLD_PROFILE, BOOTSTRAP_PROFILE, MANUAL_CYCLE_BOOTSTRAP_PROFILE}
-                and name in PINNED_ASSETS
-                and name not in {'observation_v2', 'connector_ownership',
-                                 'coal_manual_journal_v1', 'coal_manual_cycle_v2',
-                                 'connector_observer_bridge_v1'}):
-        if expected != PINNED_ASSETS.get(name):
+    if (isinstance(manifest, dict) and type(profile) is str
+            and profile in _RETAINED_PROFILES
+            and name in PINNED_ASSETS
+            and name not in {'observation_v2', 'connector_ownership',
+                             'coal_manual_journal_v1', 'coal_manual_cycle_v2',
+                             'connector_observer_bridge_v1'}):
+        valid_expected = {PINNED_ASSETS.get(name)}
+        if name == 'launch_readiness':
+            valid_expected.add(launch_readiness_sha256())
+        if type(expected) is not str or expected not in valid_expected:
             raise RuntimeError('Retained native asset differs from the legacy profile')
         return True
     if expected is None or hashlib.sha256(asset).hexdigest() != expected:
