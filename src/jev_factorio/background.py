@@ -649,6 +649,11 @@ class BackgroundWorkLoop(HierarchicalLoop):
         if job:
             plans = independent_candidates(
                 self.memory.active_goal, snapshot, self.catalog, job, self.planner_type)
+            # The common compiler qualifies smaller gathers through its existing
+            # progress-history checks before retry budgets are evaluated. Keep the
+            # active-job override on that path so a qualified remainder does not
+            # inherit an exhausted canonical-plan failure count.
+            plans = [self._gather_remainder_plan(plan, snapshot) for plan in plans]
             plans = [plan for plan in plans if self.memory.failures.get(plan.id, 0) < 2]
             return plans or [background_wait(self.memory.active_goal, job, snapshot.tick)], ""
         plans, blocker = super()._compile_candidates(snapshot)
@@ -656,6 +661,9 @@ class BackgroundWorkLoop(HierarchicalLoop):
                 and plans[0].steps[0].effect == "research_progress"):
             independent = independent_candidates(
                 self.memory.active_goal, snapshot, self.catalog, None, self.planner_type)
+            # Research-wait replacement uses the same independent-work candidates
+            # and must apply the common progress-history qualification first.
+            independent = [self._gather_remainder_plan(plan, snapshot) for plan in independent]
             plans = [plan for plan in independent
                      if self.memory.failures.get(plan.id, 0) < 2] or plans
         return [self._tracked_plan(plan, snapshot) for plan in plans], blocker
