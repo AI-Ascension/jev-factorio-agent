@@ -7,14 +7,209 @@ local function set_admission_evidence(enabled)
     assert(type(enabled)=="boolean","Coal admission evidence opt-in must be boolean")
     storage.coal_supply.admission_evidence=enabled
 end
+
+-- Source-faithful read-only counter projection for completion queries.  It is
+-- intentionally available when this attachment is reloaded over an existing
+-- revision-4 runtime; it never invokes q.sample/before_observe or writes q rows.
+local function completion_sample(q,solid_samples)
+    local api=assert(r.coal_api,"Coal completion API unavailable")
+    local p,ch=api.epoch()
+    assert(game.connected_players and #game.connected_players==1
+        and game.connected_players[1]==p,"Coal completion requires the retained single actor")
+    assert(type(solid_samples)=="table" and type(q.rows)=="table",
+        "Coal completion sample input is malformed")
+    local result={schema=1,producer="coal_supply_readonly_completion_v1",
+        session_id=storage.jev_session_id,tick=game.tick,actor_index=p.index,
+        actor_unit=ch.unit_number,surface_index=ch.surface.index,force_index=ch.force.index,
+        sources={}}
+    local function integer(value)
+        return type(value)=="number" and value>=0 and value<=9007199254740991 and value%1==0
+    end
+    local function finite(value)
+        return type(value)=="number" and value==value and value>=0 and value<math.huge
+    end
+    local function same_point(left,right)
+        return type(left)=="table" and type(right)=="table"
+            and (left.x or left[1])==(right.x or right[1])
+            and (left.y or left[2])==(right.y or right[2])
+    end
+    local function overlaps(left,right)
+        return left.left_top.x<right.right_bottom.x and right.left_top.x<left.right_bottom.x
+            and left.left_top.y<right.right_bottom.y and right.left_top.y<left.right_bottom.y
+    end
+    local function route_sample(target,row)
+        local found=nil
+        for _,sample in pairs(solid_samples) do
+            if type(sample)=="table" and sample.source_role=="coal:"..target..":chest" then
+                assert(not found and sample.target_role==row.target.role,"Coal corridor identity is ambiguous")
+                found=sample
+            end
+        end
+        assert(found and found.counters and found.counters.ready==true
+            and found.target_unit==row.target.unit_number,"Coal source lacks a current paid corridor sample")
+        return found
+    end
+    local function resource_total(row)
+        local bounds=row.mining_area
+        assert(type(bounds)=="table" and type(bounds.left_top)=="table"
+            and type(bounds.right_bottom)=="table" and type(row.resources)=="table",
+            "Coal retained resource identity is unavailable")
+        local found=ch.surface.find_entities_filtered{
+            area={{bounds.left_top.x,bounds.left_top.y},{bounds.right_bottom.x,bounds.right_bottom.y}},
+            type="resource",limit=65}
+        assert(#found<=64,"Coal completion resource bound exceeded")
+        local expected,total={},0
+        for _,entity in ipairs(row.resources) do
+            if entity.valid then expected[entity]=true end
+        end
+        for _,entity in ipairs(found) do
+            local prototype=entity.prototype
+            local mineable=prototype and prototype.mineable_properties
+            assert(entity.valid and entity.name=="coal" and entity.type=="resource"
+                and integer(entity.amount) and prototype and not prototype.infinite_resource
+                and prototype.resource_category=="basic-solid" and mineable and mineable.minable
+                and not mineable.required_fluid and #mineable.products==1,
+                "Coal completion resource contract changed")
+            local product=mineable.products[1]
+            assert(product.type=="item" and product.name=="coal" and product.amount==1
+                and (product.probability or 1)==1 and not product.amount_min and not product.amount_max,
+                "Coal completion resource yield changed")
+            assert(expected[entity],"Coal resource was replaced or added")
+            expected[entity]=nil;total=total+entity.amount
+        end
+        assert(next(expected)==nil and integer(total),"Coal retained resource moved or disappeared")
+        local near=ch.surface.find_entities_filtered{
+            area={{bounds.left_top.x-10,bounds.left_top.y-10},
+                {bounds.right_bottom.x+10,bounds.right_bottom.y+10}},type="mining-drill",limit=65}
+        assert(#near<=64,"Coal completion drill bound exceeded")
+        for _,entity in ipairs(near) do
+            if not row.parts.drill or entity~=row.parts.drill.entity then
+                assert(entity.mining_area and not overlaps(
+                    {left_top=entity.mining_area.left_top,right_bottom=entity.mining_area.right_bottom},bounds),
+                    "Foreign drill intersects retained coal source")
+            end
+        end
+        return total
+    end
+    local function fuel_energy(row)
+        local target=api.endpoint_ok(row.target,"coal",false)
+        local burner=target.burner
+        local value=prototypes.item.coal and prototypes.item.coal.fuel_value
+        assert(burner and finite(value) and value>0,"Coal completion fuel energy unavailable")
+        local count=api.stock(target.get_fuel_inventory(),"coal",true)
+        local burning=burner.currently_burning
+        assert(not burning or ((type(burning.name)=="string" and burning.name or burning.name.name)=="coal"
+            and (not burning.quality or burning.quality.name=="normal")),"Mixed coal completion fuel")
+        assert(finite(burner.remaining_burning_fuel) and finite(burner.heat),
+            "Coal completion burner energy is invalid")
+        return count*value+burner.remaining_burning_fuel+burner.heat,value,target
+    end
+    local function powered_now(row,drill)
+        local power=row.power
+        assert(type(power)=="table" and power.energized==true,
+            "Coal completion retained power qualification is unavailable")
+        local pole=api.owner(power.pole_role)
+        local witness=api.owner(power.witness_role)
+        local radius=pole.prototype and pole.prototype.get_supply_area_distance
+            and pole.prototype.get_supply_area_distance(pole.quality)
+        assert(pole.unit_number==power.pole_unit and pole.name:find("electric%-pole$")
+            and pole.electric_network_id==power.network_id and pole.surface==ch.surface
+            and pole.force==ch.force and type(radius)=="number" and radius>=0 and radius<math.huge
+            and math.abs(pole.position.x-drill.position.x)<=radius
+            and math.abs(pole.position.y-drill.position.y)<=radius
+            and witness.unit_number==power.witness_unit and witness.electric_network_id==power.network_id
+            and witness.surface==ch.surface and witness.force==ch.force and witness.energy>0
+            and drill.electric_network_id==power.network_id and drill.energy>0,
+            "Coal completion qualified power network changed")
+        return true
+    end
+    local count=0
+    for target,row in pairs(q.rows) do
+        count=count+1;assert(count<=4 and type(target)=="string" and type(row)=="table")
+        local output={target=target,layout=row.layout,route=row.route or "",status="incomplete"}
+        result.sources[target]=output
+        if q.committed and row.parts and row.parts.chest and row.parts.drill
+                and not row.fault and not row.pending and not row.manual_pending then
+            local target_entity=api.endpoint_ok(row.target,"coal",false)
+            assert(target_entity.unit_number==row.target.unit_number and row.target.role==target,
+                "Coal completion target identity changed")
+            for _,spec in ipairs(row.steps) do
+                local part=row.parts[spec.part]
+                if part then
+                    local entity=api.owner(part.role)
+                    assert(entity==part.entity and entity.unit_number==part.unit_number
+                        and entity.name==spec.name and entity.quality and entity.quality.name=="normal"
+                        and same_point(entity.position,spec.position) and entity.direction==spec.direction
+                        and part.paid==1,"Coal completion paid receipt changed")
+                end
+            end
+            local drill=row.parts.drill.entity
+            assert(drill.get_module_inventory and (not drill.get_module_inventory() or drill.get_module_inventory().is_empty())
+                and drill.productivity_bonus==0 and drill.drop_target==row.parts.chest.entity
+                and drill.mining_area and same_point(drill.mining_area.left_top,row.mining_area.left_top)
+                and same_point(drill.mining_area.right_bottom,row.mining_area.right_bottom),
+                "Coal completion drill geometry changed")
+            powered_now(row,drill)
+            local route=route_sample(target,row)
+            local remaining=resource_total(row)
+            assert(integer(row.base_ore) and remaining<=row.base_ore,
+                "Coal completion resource counter regressed")
+            local mined=row.base_ore-remaining
+            local chest=api.stock(row.parts.chest.entity.get_inventory(defines.inventory.chest),"coal",true)
+            local pipe=route.counters.pipe
+            assert(integer(chest) and integer(pipe),"Coal completion transport counter is invalid")
+            local contained=chest+pipe
+            assert(contained<=mined,"Coal completion coal appears without source depletion")
+            local lower=math.max(row.delivered or 0,mined-contained-1)
+            local upper=mined-contained
+            local energy,value,target_now=fuel_energy(row)
+            local manual=row.manual_total-row.base_manual
+            assert(integer(row.base_manual) and integer(row.manual_total) and integer(manual)
+                and row.manual_total>=row.base_manual and finite(row.base_energy)
+                and finite(row.base_energy) and finite(row.fuel_value) and value==row.fuel_value
+                and energy<=row.base_energy+(upper+manual)*value+1,
+                "Coal completion fuel accounting is unbound")
+            local burned=math.max(0,row.base_energy+(lower+manual)*value-energy)
+            local parts={}
+            for part,value_part in pairs(row.parts) do
+                parts[part]={role=value_part.role,unit_number=value_part.unit_number,
+                    receipt=value_part.receipt,paid=value_part.paid}
+            end
+            output={target=target,layout=row.layout,route=route.route,status="ready",
+                route_layout=route.layout,source_first_tick=row.first_tick or false,
+                target_unit=target_now.unit_number,chest_unit=row.parts.chest.unit_number,
+                drill_unit=row.parts.drill.unit_number,parts=parts,
+                base_ore=row.base_ore,base_energy=row.base_energy,base_manual=row.base_manual,
+                initial_delivered=row.delivered or 0,fuel_value=value,
+                baseline_flow=row.flow and {layout=row.flow.layout,route_layout=row.flow.route_layout,
+                    method=row.flow.method,first_tick=row.flow.first_tick,last_tick=row.flow.last_tick,
+                    last_positive_tick=row.flow.last_positive_tick,positive_samples=row.flow.positive_samples,
+                    mined=row.flow.mined,delivered_lower=row.flow.delivered_lower,
+                    manual_inserted=row.flow.manual_inserted,drill_unit=row.flow.drill_unit,
+                    chest_unit=row.flow.chest_unit,target_unit=row.flow.target_unit,
+                    burned_lower_joules=row.flow.burned_lower_joules,
+                    initial_fuel_joules=row.flow.initial_fuel_joules,
+                    target_fuel_joules=row.flow.target_fuel_joules,
+                    fuel_value_joules=row.flow.fuel_value_joules,
+                    in_transit_uncertainty=row.flow.in_transit_uncertainty,self_fuel=row.flow.self_fuel} or {},
+                counters={tick=game.tick,remaining=remaining,mined=mined,contained=contained,
+                    chest=chest,pipe=pipe,energy=energy,manual=manual,delivered_lower=lower,
+                    burned_lower_joules=burned}}
+            result.sources[target]=output
+        end
+    end
+    return result
+end
 if storage.coal_supply then
     assert(r.coal==storage.coal_supply and r.coal.revision==4 and c.prepare_coal_source==r.coal.prepare
         and c.build_coal_source==r.coal.build,"Coal runtime requires reconciliation")
+    r.coal.completion_sample=completion_sample
     c.set_coal_admission_evidence=set_admission_evidence
     return
 end
 local q={revision=4,targets={},rows={},committed=false,serial=0,reason="no_supported_bundle",admission_evidence=false}
 storage.coal_supply,r.coal=q,q
+q.completion_sample=completion_sample
 local a=r.coal_api
 local vec={{x=0,y=-1},{x=1,y=0},{x=0,y=1},{x=-1,y=0}}
 local function text(s,n) return type(s)=="string" and #s>0 and #s<=(n or 128) and not s:find("[^ -~]") end

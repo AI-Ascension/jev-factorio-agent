@@ -186,14 +186,21 @@ def validate_corridor_reservations(rows: dict) -> None:
                         raise ValueError("Solid corridor reservation conflict")
 
 
-def routes(snapshot) -> dict:
+def _routes(snapshot, *, completion: bool) -> dict:
     data = snapshot.factory.get("solid_routes")
-    if (not isinstance(data, dict) or set(data) != {"protocol", "session_id", "tick", "actor_index", "surface_index", "force_index", "routes", "diagnostics"}
+    fields = {"protocol", "session_id", "tick", "actor_index", "surface_index", "force_index", "routes", "diagnostics"}
+    if completion:
+        fields.add("diagnostics_tick")
+    if (not isinstance(data, dict) or set(data) != fields
             or not integer(data["protocol"], 1, 1) or data["session_id"] != snapshot.session_id
             or not integer(data["tick"]) or data["tick"] != snapshot.tick
             or any(not integer(data[key], 1) for key in ("actor_index", "surface_index", "force_index"))
             or not isinstance(data["routes"], dict) or len(data["routes"]) > MAX_ROUTES):
         raise ValueError("Missing or stale solid-route snapshot")
+    if completion and (not integer(data["diagnostics_tick"])
+                       or data["diagnostics_tick"] > snapshot.tick
+                       or snapshot.tick - data["diagnostics_tick"] > MAX_FLOW_IDLE_TICKS):
+        raise ValueError("Solid diagnostic evidence is future-dated or expired")
     diagnostics = data["diagnostics"]
     if not isinstance(diagnostics, list) or not 0 <= len(diagnostics) <= MAX_ROUTES:
         raise ValueError("Invalid solid diagnostic cardinality")
@@ -213,7 +220,7 @@ def routes(snapshot) -> dict:
         validate_row(row, key)
         if row["flow"].get("method") == "exclusive_mined_coal_lower_bound":
             from .coal_supply import binds_solid_flow
-            if not binds_solid_flow(row, snapshot):
+            if not binds_solid_flow(row, snapshot, completion=completion):
                 raise ValueError("Mined coal route lacks matching source evidence")
         # Initial topology permits one corridor per endpoint; no silent branches.
         ids = {row["source"]["unit_number"], row["target"]["unit_number"]}
@@ -222,10 +229,33 @@ def routes(snapshot) -> dict:
         if ids & (endpoints | components) or new & (endpoints | components) or new_receipts & receipts:
             raise ValueError("Solid routes share an endpoint, component or receipt")
         endpoints.update(ids); components.update(new); receipts.update(new_receipts)
-        if row["flow"] and row["flow"]["last_tick"] != snapshot.tick:
-            raise ValueError("Solid flow evidence is not from this observation")
+        if row["flow"]:
+            flow_tick = row["flow"]["last_tick"]
+            if completion:
+                if flow_tick > snapshot.tick:
+                    raise ValueError("Solid flow evidence is from the future")
+            elif flow_tick != snapshot.tick:
+                raise ValueError("Solid flow evidence is not from this observation")
     validate_corridor_reservations(data["routes"])
     return data["routes"]
+
+
+def routes(snapshot) -> dict:
+    """Validate a route for ordinary planning at this exact observation tick."""
+    return _routes(snapshot, completion=False)
+
+
+def completion_routes(snapshot) -> dict:
+    """Validate retained routes for completion without refreshing telemetry.
+
+    A completion query is read-only and can span ordinary game ticks. It may
+    therefore consume an earlier flow sample, but only when the outer route
+    observation is current and the sample is not from the future. Callers must
+    still require :func:`completion_flow_complete`, whose existing 600-tick
+    positive-flow bound and ownership checks determine whether the sample is
+    sufficiently fresh for completion.
+    """
+    return _routes(snapshot, completion=True)
 
 
 def current(row, snapshot) -> bool:
@@ -293,6 +323,23 @@ def flow_complete(route, layout, snapshot) -> bool:
         return bool(flow and flow["last_tick"]-flow["first_tick"] >= 120
                     and min(flow["positive_samples"], flow["sent"], flow["received"]) >= 3
                     and flow["last_tick"]-flow["last_positive_tick"] <= MAX_FLOW_IDLE_TICKS)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def completion_flow_complete(route, layout, snapshot) -> bool:
+    """Completion-only counterpart that never relaxes ordinary route planning."""
+    try:
+        row = completion_routes(snapshot).get(route)
+        if (not row or not current(row, snapshot) or row["layout"] != layout or row["state"] != "ready" or not row["topology"]
+                or row["reason"] != "observing_flow"):
+            return False
+        flow = row["flow"]
+        return bool(flow and flow["last_tick"] <= snapshot.tick
+                    and flow["last_tick"]-flow["first_tick"] >= 120
+                    and min(flow["positive_samples"], flow["sent"], flow["received"]) >= 3
+                    and flow["last_tick"]-flow["last_positive_tick"] <= MAX_FLOW_IDLE_TICKS
+                    and snapshot.tick-flow["last_positive_tick"] <= MAX_FLOW_IDLE_TICKS)
     except (ValueError, KeyError, TypeError, AttributeError):
         return False
 
