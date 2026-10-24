@@ -8,7 +8,7 @@ import time
 import pytest
 
 playwright = pytest.importorskip("playwright.sync_api", reason="Install .[dashboard-test] for browser tests")
-from jev_factorio.dashboard import DashboardServer, EventWriter, Monitor
+from jev_factorio.dashboard import DashboardServer, EventWriter, Monitor, project_record
 
 
 @pytest.fixture
@@ -734,6 +734,28 @@ def test_mission_stale_snapshot_does_not_rejuvenate_on_model_event(live):
         };
     }''')
     assert rendered == {'freshness': 'STALE / DISCONNECTED', 'historical': True}
+    assert not errors
+
+
+def test_explicit_empty_after_state_clears_launch_and_current_research_display(live):
+    from test_dashboard_mission import mission_state
+
+    page, writer, url, errors = live
+    page.goto(url)
+    complete = mission_state()
+    writer.emit("decision_recorded", 7, record=project_record({
+        "after_state": complete, "action": "observe",
+    }))
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch prerequisites observed")
+    playwright.expect(page.locator("#mission-production")).to_contain_text("rocket-silo")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("LATEST CAPTURED OBSERVATION")
+
+    writer.emit("decision_recorded", 7, record=project_record({
+        "state": complete, "after_state": {}, "action": "observe",
+    }))
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch evidence unavailable")
+    playwright.expect(page.locator("#mission-production")).not_to_contain_text("rocket-silo")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("STALE / DISCONNECTED")
     assert not errors
 
 

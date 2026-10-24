@@ -98,9 +98,14 @@ def project_state(value: dict) -> dict:
 
 def project_record(value: dict) -> dict:
     record = {"mission_record": dashboard_mission.project_record(value)}
-    state = value.get("after_state") or value.get("state")
+    has_after_state = "after_state" in value
+    state = value.get("after_state") if has_after_state else value.get("state")
+    if has_after_state and (not isinstance(state, dict) or not state):
+        # An explicit incomplete observation clears the current display. In
+        # particular, do not carry forward the pre-action state or research.
+        record["state"] = {}
     if isinstance(state, dict):
-        if not isinstance(state.get("factory"), dict):
+        if not has_after_state and not isinstance(state.get("factory"), dict):
             # Legacy records keep factory facts (current research) with the decision.
             decision = value.get("decision")
             facts = decision.get("state", {}).get("facts") if isinstance(decision, dict) else None
@@ -108,7 +113,8 @@ def project_record(value: dict) -> dict:
             if isinstance(factory, dict):
                 state = dict(state, factory={key: factory[key] for key in ("research", "research_progress")
                                              if key in factory})
-        record["state"] = project_state(state)
+        if not has_after_state or state:
+            record["state"] = project_state(state)
     # Keep the bounded observation before potentially large model decision data.
     record.update({key: value[key] for key in RECORD_KEYS
                    if key in value and key != "persistent_recovery"})
@@ -622,14 +628,16 @@ class Monitor:
                     self.view["reconstruction_status"] = "ok"
                 if self.legacy:
                     # Legacy records expose completed decisions, NOT in-flight model phases.
-                    if not isinstance(row.get("state"), dict) or "action" not in row:
+                    if "action" not in row:
                         self.rejected += 1
                         continue
-                    state = row.get("after_state") or row["state"]
-                    if not isinstance(state, dict):
+                    has_after_state = "after_state" in row
+                    state = row.get("after_state") if has_after_state else row.get("state")
+                    if not has_after_state and not isinstance(state, dict):
                         self.rejected += 1
                         continue
-                    identity = str(row.get("session_id") or state.get("session_id") or "legacy")
+                    state_identity = state if isinstance(state, dict) else {}
+                    identity = str(row.get("session_id") or state_identity.get("session_id") or "legacy")
                     # A copied legacy file must not rejuvenate an old recorded snapshot.
                     timestamp, recorded_at = self.tail.mtime, ""
                     try:
