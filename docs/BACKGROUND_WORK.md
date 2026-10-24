@@ -78,20 +78,48 @@ required; unsupported or missing receipt evidence fails closed.
 
 ## Recovery and checkpoint compatibility
 
-`BackgroundMemory` adds named `background_schema: 2`, `background_job`, and
-`background_attempt` fields to the schema-2 checkpoint. Admission transfers the
-pending attempt identity to the background job; acknowledgement alone creates no
-verified outcome. Observed completion records that identity without changing any
-concurrent foreground attempt. Background latency remains unknown across this
-handoff.
+`BackgroundMemory` adds named `background_schema`, `background_job`, and
+`background_attempt` fields to the schema-2 checkpoint. New admissions use
+background extension schema 3 and also retain the exact admitted step in
+`background_step`. Empty or completed background extensions remain schema 2;
+the schema-3 requirement applies while a job owns an active attempt and step.
+All checkpoints written by this revision include the `background_step` field,
+including `null` when no job is active. A reader from before this field was
+introduced rejects the checkpoint's unknown field even when its extension
+number is still schema 2. The extension number alone does not promise
+cross-revision compatibility.
+Admission transfers the pending attempt identity to the background job;
+acknowledgement alone creates no verified outcome. Observed completion records
+that identity without changing any concurrent foreground attempt. Background
+latency remains unknown across this handoff.
+
+For schema-3 jobs with an attempt, checkpoint loading verifies that the saved
+step matches its fingerprint and binds to the job's recipe parameters, paid
+inputs, output item, plan, and fixed deadline. Admission performs these checks
+against the live foreground step before it clears pending state. Older schema-2
+jobs did not retain the full step, so loading accepts them only when the attempt
+hash matches the canonical tracked-craft step reconstructed from the job's
+receipt fields; other schema-2 jobs fail closed as unprovable. Schema-1 jobs
+without an attempt retain their documented unknown-attempt migration behavior
+and do not receive a fabricated attempt. No migration rewrites attempt identity
+or history. A reader that supports only extension schemas 1 and 2 rejects an
+active schema-3 checkpoint. A reader predating `background_step` rejects both
+new schema-2 and schema-3 checkpoints because its checkpoint constructor does
+not accept that field; it must not resume or rewrite them while discarding
+`background_step`.
+
+When a returned craft remains foreground-pending and a later poll proves its
+receipt is running, the controller traces the unsatisfied pending-poll predicate
+before transferring the same attempt to background ownership. This uses the
+existing poll snapshot and dispatch; it does not poll or dispatch again.
 
 Legacy schema-1 checkpoints load without rewriting the source. An existing
 background extension at version 1 retains its job and explicitly unknown attempt
 identity until completion; no dispatch identity or timing is fabricated. New
-admissions use extension version 2. Offline diagnostics understand both background
+admissions use extension version 3. Offline diagnostics understand both background
 and input-route extensions and preserve their evidence in the report. A new
-background checkpoint is deliberately rejected by an older reader rather than
-silently losing work. Do not remove extension fields, downgrade the version, or
+background checkpoint is refused by an older reader rather than silently losing
+work. Do not remove extension fields, downgrade the version, or
 restore an old checkpoint against a newer world for rollback.
 
 Atomic replacement and file fsync persist each job transition. This controller
