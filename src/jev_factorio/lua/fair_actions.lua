@@ -51,7 +51,7 @@ end
 fair.stop = function(reason)
     -- Cleanup must still stop the original player when configuration drifts.
     local player = game.get_player(player_index)
-    if player and player.character == (storage.agent_characters or {})[1] then
+    if player then
         player.walking_state = {walking = false}
         player.mining_state = {mining = false}
     end
