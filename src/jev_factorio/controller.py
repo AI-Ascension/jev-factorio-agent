@@ -42,6 +42,10 @@ from .wait_record_codec import Encoder as WaitRecordEncoder, encode_line as enco
 
 MAX_ASYNC_CONTROLLER_WORKERS = 4
 MAX_ASYNC_RESOURCE_SLOTS = 128
+_LEGACY_ROCKET_CAPABILITY_BLOCK = (
+    "Missing full-game production/research/construction skills and "
+    "version-specific native rocket victory telemetry"
+)
 _ASYNC_RESOURCE_GUARD = threading.Lock()
 _ASYNC_RESOURCE_SLOTS: dict[tuple[str, str], dict] = {}
 _SYNC_RESOURCE_USERS: dict[tuple[str, str], int] = {}
@@ -2025,6 +2029,87 @@ class HierarchicalLoop(AgentLoop):
         return ((getattr(memory, "background_job", None) is None)
                 != (getattr(memory, "background_attempt", None) is None))
 
+    def _legacy_rocket_capability_resume_candidate(self) -> bool:
+        """Recognize only the idle historical rocket block with current typed capability.
+
+        A restored blocked checkpoint is otherwise terminal. This narrow case
+        may pass through the ordinary current planner only after the existing
+        checkpoint/source/observation checks, with the normal safety admission
+        still ahead of planning. Unresolved or separately owned work stays blocked.
+        """
+        from .planning.catalog import Catalog
+
+        memory = self.memory
+        if (not isinstance(memory, CampaignMemory)
+                or not isinstance(self.catalog, Catalog)
+                or not self.resume_controller or self.checkpoint is None
+                or memory.version != 2
+                or memory.status != "blocked"
+                or memory.reason != _LEGACY_ROCKET_CAPABILITY_BLOCK
+                or memory.target != "rocket_launch"
+                or memory.active_goal != "rocket_launch"
+                or "rocket_launch" in memory.completed_goals
+                or not {"stockpile_fuel", "bootstrap_mining"} <= set(memory.completed_goals)
+                or memory.pending is not None or memory.active_plan is not None
+                or memory.attempt is not None or memory.transfer_recovery is not None
+                or memory.async_decision is not None or memory.capital_investment is not None
+                or memory.blocked_recovery is not None
+                or memory.blocked_recovery_archive is not None
+                or memory.blocked_reevaluations
+                or self._reevaluate_blocked_once or self.persist_recoverable_blocks
+                or self._persistence_failed or self._capital_fault
+                or self._persistent_idle_exhausted):
+            return False
+
+        # Keep every paid/background/extension obligation outside this one
+        # capability migration. Empty schema bindings remain attached and are
+        # reconciled against the fresh observation by the normal path.
+        if memory.reservations:
+            return False
+        connector = memory.connector_ownership
+        if connector is not None and connector.get("routes"):
+            return False
+        if any(getattr(memory, name, None) for name in (
+                "background_job", "background_attempt", "background_step",
+                "output_commitments", "input_commitments", "outpost_commitments",
+                "successor_projects", "successor_receipts", "solid_intents", "solid_epoch",
+                "solid_commitments", "solid_funding", "coal_targets", "coal_epoch",
+                "coal_commitments", "coal_funding")):
+            return False
+        if any(row.get("kind") == "legacy_capability_block_resumed" for row in memory.history):
+            return False
+        # The transition event must not evict a retained ordinary history row.
+        if sum(row.get("kind") != "paid_duplicate_selection_reconciled"
+               for row in memory.history) >= 64:
+            return False
+        if isinstance(self.jev, ProviderCircuit) and self.jev.state.get("phase") != "healthy":
+            return False
+        return True
+
+    def _record_legacy_rocket_capability_resume(self, snapshot: GameSnapshot,
+                                                plans: list[Plan]) -> None:
+        """Persist current-planner qualification before selection or dispatch."""
+        if not self._legacy_rocket_capability_resume_candidate():
+            return
+        prior_status, prior_reason = self.memory.status, self.memory.reason
+        prior_history = deepcopy(self.memory.history)
+        self.memory.status, self.memory.reason = "running", ""
+        try:
+            self.memory.event(
+                "legacy_capability_block_resumed",
+                schema=1,
+                goal="rocket_launch",
+                prior_reason=_LEGACY_ROCKET_CAPABILITY_BLOCK,
+                catalog_version=self.catalog.version,
+                candidate_plan_ids=[plan.id for plan in plans],
+                tick=snapshot.tick,
+            )
+            self._save()
+        except BaseException:
+            self.memory.status, self.memory.reason = prior_status, prior_reason
+            self.memory.history = prior_history
+            raise
+
     def _persistent_block_active(self) -> bool:
         from .blocked_persistence import is_recoverable_reason
         memory = self.memory
@@ -3831,7 +3916,8 @@ class HierarchicalLoop(AgentLoop):
                 self._consume_blocked_reevaluation(snapshot)
         if self.memory.status == "uncertain" and self.memory.pending:
             return self._verify_pending(snapshot)
-        if self.terminal and not blocked_reevaluation:
+        legacy_capability_resume = self._legacy_rocket_capability_resume_candidate()
+        if self.terminal and not blocked_reevaluation and not legacy_capability_resume:
             return self._record(snapshot, "observe", self.memory.reason)
         # Resolve in-flight work before processing model requests or goal changes.
         if self.memory.pending:
@@ -3844,7 +3930,7 @@ class HierarchicalLoop(AgentLoop):
         if self.terminal and not (
             blocked_reevaluation and self.memory.status == "blocked"
             and self.memory.reason == blocked_reevaluation_reason
-        ):
+        ) and not self._legacy_rocket_capability_resume_candidate():
             return self._record(snapshot, "observe", self.memory.reason, verified=True)
         if self.memory.active_plan is None:
             # The checkpoint intentionally remains blocked until useful work
@@ -3934,6 +4020,8 @@ class HierarchicalLoop(AgentLoop):
                 self._planning_diagnostics["ranked_plan_ids"] = [p.id for p in plans]
                 self._planning_diagnostics["candidate_evidence"] = deepcopy(
                     self._selection_support["candidate_evidence"])
+            if plans:
+                self._record_legacy_rocket_capability_resume(snapshot, plans)
             if getattr(self, "_solid_science_policy", False):
                 # Capture the exact executable frontier independently of the
                 # later selected-plan event. This diagnostic is never a prompt
