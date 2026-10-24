@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections import deque
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -361,6 +362,105 @@ class EventWriter:
             self.fd = None
 
 
+class _DashboardModelObserver:
+    """The one model wrapper admitted by dashboard.attach.
+
+    Its dispatch implementation is pinned below so a later instance or class
+    override cannot keep the original provider visible while routing evaluation
+    through a different client.
+    """
+
+    def __init__(self, model_client, emit, measured):
+        self.model_client = model_client
+        self._emit = emit
+        self._measured = measured
+
+    def __getattr__(self, key):
+        return getattr(self.model_client, key)
+
+    def evaluate(self, state, questions):
+        self._emit("model_request", 5,
+                   candidates=state.get("candidate_plans", {}), questions=questions)
+        result = self._measured("model", 5, self.model_client.evaluate, state, questions)
+        self._emit("model_response", 5, answers=result,
+                   usage=getattr(self.model_client, "last_usage", None),
+                   model=getattr(self.model_client, "last_model", None))
+        return result
+
+
+_SUPPORTED_DASHBOARD_MODEL_OBSERVER_TYPE = _DashboardModelObserver
+_SUPPORTED_DASHBOARD_MODEL_OBSERVER_NAMESPACE = dict(
+    vars(_SUPPORTED_DASHBOARD_MODEL_OBSERVER_TYPE))
+_SUPPORTED_DASHBOARD_MODEL_OBSERVER_METHODS = {
+    name: _SUPPORTED_DASHBOARD_MODEL_OBSERVER_NAMESPACE[name]
+    for name in ("__init__", "__getattr__", "evaluate")
+}
+_SUPPORTED_DASHBOARD_MODEL_OBSERVER_CODE = {
+    name: method.__code__
+    for name, method in _SUPPORTED_DASHBOARD_MODEL_OBSERVER_METHODS.items()
+}
+_dashboard_model_observer_lock = threading.RLock()
+_dashboard_model_observer_bindings = weakref.WeakKeyDictionary()
+
+
+def _dashboard_model_observer_shape_is_current(observer, model_client) -> bool:
+    """Check exact dashboard wrapper code and direct per-instance bindings."""
+    if type(observer) is not _SUPPORTED_DASHBOARD_MODEL_OBSERVER_TYPE:
+        return False
+    try:
+        namespace = type.__getattribute__(type(observer), "__dict__")
+        if (set(namespace) != set(_SUPPORTED_DASHBOARD_MODEL_OBSERVER_NAMESPACE)
+                or any(namespace.get(name) is not value
+                       for name, value in _SUPPORTED_DASHBOARD_MODEL_OBSERVER_NAMESPACE.items())):
+            return False
+        if any(namespace[name].__code__ is not code
+               for name, code in _SUPPORTED_DASHBOARD_MODEL_OBSERVER_CODE.items()):
+            return False
+        attributes = vars(observer)
+        return (
+            set(attributes) == {"model_client", "_emit", "_measured"}
+            and attributes.get("model_client") is model_client
+        )
+    except (TypeError, AttributeError):
+        return False
+
+
+def _register_dashboard_model_observer_binding(
+        loop, observer, model_client) -> bool:
+    """Record only the exact wrapper and callbacks created by ``attach``."""
+    if not _dashboard_model_observer_shape_is_current(observer, model_client):
+        return False
+    try:
+        attributes = vars(observer)
+        binding = (weakref.ref(loop), id(model_client),
+                   attributes["_emit"], attributes["_measured"])
+        with _dashboard_model_observer_lock:
+            _dashboard_model_observer_bindings[observer] = binding
+        return True
+    except (TypeError, AttributeError):
+        return False
+
+
+def _dashboard_model_observer_binding_is_current(
+        loop, observer, model_client) -> bool:
+    """Authenticate the attached wrapper before it can support legacy resume."""
+    if not _dashboard_model_observer_shape_is_current(observer, model_client):
+        return False
+    try:
+        attributes = vars(observer)
+        with _dashboard_model_observer_lock:
+            binding = _dashboard_model_observer_bindings.get(observer)
+        return (
+            binding is not None
+            and binding[0]() is loop
+            and binding[1] == id(model_client)
+            and binding[2] is attributes.get("_emit")
+            and binding[3] is attributes.get("_measured")
+        )
+    except (TypeError, AttributeError):
+        return False
+
+
 def attach(loop: Any, writer: EventWriter) -> None:
     """Decorate only this loop instance; delegate every existing call exactly once.
 
@@ -421,23 +521,20 @@ def attach(loop: Any, writer: EventWriter) -> None:
             emit("action", 6, action=action, parameters=parameters)
             return measured("dispatch", 6, self.backend.execute, action, parameters)
 
-    class ModelObserver:
-        def __init__(self, model):
-            self.model_client = model
-
-        def __getattr__(self, key):
-            return getattr(self.model_client, key)
-
-        def evaluate(self, state, questions):
-            emit("model_request", 5, candidates=state.get("candidate_plans", {}), questions=questions)
-            result = measured("model", 5, self.model_client.evaluate, state, questions)
-            emit("model_response", 5, answers=result, usage=getattr(self.model_client, "last_usage", None),
-                 model=getattr(self.model_client, "last_model", None))
-            return result
-
     loop.backend = BackendObserver(loop.backend)
     if loop.jev is not None:
-        loop.jev = ModelObserver(loop.jev)
+        original_model = loop.jev
+        observer = _DashboardModelObserver(original_model, emit, measured)
+        # Register only the exact observer just constructed here, and only
+        # with the supported controller type. The controller uses this pair
+        # to detect later observer/client replacement; it does not infer
+        # health authority through arbitrary wrappers.
+        from .controller import HierarchicalLoop
+        if isinstance(loop, HierarchicalLoop):
+            _register_dashboard_model_observer_binding(loop, observer, original_model)
+            HierarchicalLoop._register_dashboard_model_observer(
+                loop, observer, original_model)
+        loop.jev = observer
 
     def decorate(name: str, wrapper: Callable) -> None:
         original = getattr(loop, name)
