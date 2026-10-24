@@ -1,0 +1,52 @@
+{
+  "repository": "jevplays-games/jev-factorio-agent",
+  "worktree": "C:\\Users\\timot\\Documents\\projects\\factorio\\orchestration-20261004\\worktrees\\ownership384",
+  "branch": "orchestrate/ownership384-20261005",
+  "base": "dd2ae7f4433f3023521d8bc337325a402b044574",
+  "base_tree": "401d840e6eb55815e3fe66ad2a788026b6703c7b",
+  "results": [
+    {
+      "exit_code": 1,
+      "evidence": "evidence/ownership384/baseline-cross-family-regressions.log",
+      "stage": "pre-fix cross-family baseline",
+      "outcome": "20 failed, 3 passed in 3.41s",
+      "command": "wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384 && PYTHONPATH=/mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/src:/mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/tests /tmp/jev-factorio-orchestration-20261004-01a107e4-v2/bin/python -m pytest -q tests/test_cross_family_paid_identity.py'"
+    },
+    {
+      "exit_code": 0,
+      "evidence": "evidence/ownership384/probe_no_output_cross_family_alias.json",
+      "stage": "pre-central-hook no-output reproduction",
+      "outcome": "accepted=true for solid+coal receipt alias with output_buffers_schema=false",
+      "command": "wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384 && PYTHONPATH=/mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/src:/mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/tests /tmp/jev-factorio-orchestration-20261004-01a107e4-v2/bin/python evidence/ownership384/probe_no_output_cross_family_alias.py'"
+    },
+    {
+      "exit_code": 0,
+      "evidence": "result captured in handoff",
+      "stage": "post-fix cross-family module",
+      "outcome": "31 passed in 2.65s",
+      "command": "wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384 && PYTHONPATH=/mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/src:/mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/tests /tmp/jev-factorio-orchestration-20261004-01a107e4-v2/bin/python -m pytest -q tests/test_cross_family_paid_identity.py'"
+    },
+    {
+      "exit_code": 0,
+      "evidence": "evidence/ownership384/affected-family-tests-final.log",
+      "stage": "post-fix affected family batch",
+      "outcome": "383 passed in 23.68s",
+      "command": "wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384 && set -o pipefail && PYTHONPATH=/mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/src:/mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/tests /tmp/jev-factorio-orchestration-20261004-01a107e4-v2/bin/python -m pytest -q tests/test_cross_family_paid_identity.py tests/test_output_buffer_ownership.py tests/test_output_buffer_integration.py tests/test_successors.py tests/test_input_route_integration.py tests/test_mining_outposts.py tests/test_solid_route_integration.py tests/test_coal_supply_integration.py tests/test_coal_solid_composition.py 2>&1 | tee /mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/evidence/ownership384/affected-family-tests-final.log'"
+    },
+    {
+      "exit_code": 0,
+      "evidence": "evidence/ownership384/checkpoint-compatibility-tests.log",
+      "stage": "post-fix checkpoint compatibility batch",
+      "outcome": "152 passed in 17.47s",
+      "command": "wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384 && set -o pipefail && PYTHONPATH=/mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/src:/mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/tests /tmp/jev-factorio-orchestration-20261004-01a107e4-v2/bin/python -m pytest -q tests/test_checkpoint_io.py tests/test_coal_checkpoint_owner_composition.py tests/test_coal_funding_ownership_composition.py tests/test_solid_funding_coal_reservations.py tests/test_successor_review.py tests/test_input_route_contract.py tests/test_output_buffer_contract.py 2>&1 | tee /mnt/c/Users/timot/Documents/projects/factorio/orchestration-20261004/worktrees/ownership384/evidence/ownership384/checkpoint-compatibility-tests.log'"
+    },
+    {
+      "exit_code": 0,
+      "evidence": "evidence/ownership384/candidate.patch",
+      "stage": "patch and whitespace checks",
+      "outcome": "both passed; no WSL Git metadata was modified",
+      "command": "PowerShell: git apply --reverse --check evidence/ownership384/candidate.patch; git diff --check"
+    }
+  ],
+  "environment_note": "WSL Git reports the Windows worktree .git pointer as a non-repository; no WSL Git command changed the worktree. Windows Git generated and reverse-checked candidate.patch."
+}
