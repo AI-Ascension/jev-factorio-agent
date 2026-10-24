@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -44,6 +45,22 @@ _OWNERSHIP_FIELDS = (
     "coal_supply_schema", "coal_kit_policy", "coal_economic_admission",
     "coal_targets", "coal_epoch", "coal_commitments", "coal_funding",
 )
+
+
+@contextmanager
+def _supervisor_owner_lock():
+    """Require the same exclusive run lock used by the long-lived supervisor."""
+    path = Supervisor.lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("Another supervisor owns this repository") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _resolve_research_output_prefix(path: Path) -> Path:
@@ -1016,6 +1033,11 @@ class Supervisor:
             archive_index = getattr(selected_memory, "_blocked_recovery_archive_index", None)
             if archive_index is not None:
                 archive_index.close()
+        from .attempt_identity_archive import AttemptIdentityArchive
+        attempt_archive = AttemptIdentityArchive(path)
+        with attempt_archive.owner():
+            attempt_archive.validate_capture(
+                captured, self._launch_memory_type(treatment), "rocket_launch")
         if path.read_bytes() != captured:
             raise ValueError("Checkpoint changed during launch composition preflight")
 
@@ -2156,6 +2178,11 @@ Only report repaired when every acceptance requirement is verified.
                 return False
             current = self.checkpoint()
             checkpoint_digest = self._last_checkpoint_digest
+            from .attempt_identity_archive import AttemptIdentityArchive
+            attempt_archive = AttemptIdentityArchive(self.config.checkpoint)
+            with attempt_archive.owner():
+                attempt_archive.validate_current(
+                    None, "rocket_launch")
             if current["status"] not in {"running", "completed"}:
                 return False
             if (current["status"] == "completed"
@@ -2468,8 +2495,27 @@ Only report repaired when every acceptance requirement is verified.
                 raise RuntimeError("Another supervisor owns this repository") from error
             if manual_intervention is not None and not self.state_path.exists():
                 raise ValueError("Manual intervention requires an existing supervised run")
-            self.initialize(record_only=manual_intervention is not None,
-                            manual_audit=manual_intervention is not None)
+            try:
+                self.initialize(record_only=manual_intervention is not None,
+                                manual_audit=manual_intervention is not None)
+            except Exception as error:
+                from .attempt_identity_archive import AttemptIdentityError
+                if (manual_intervention is not None or not isinstance(error, AttemptIdentityError)
+                        or not isinstance(self.state.get("run_id"), str)
+                        or not isinstance(self.state.get("segment_id"), str)):
+                    raise
+                # An unresolved legacy checkpoint without an exact journal (or
+                # a changed checkpoint after anchoring) must stay untouched and
+                # must never reach watcher/gameplay. Keep the existing run
+                # identity and report a durable blocked status instead of
+                # escaping before the supervisor's recovery boundary.
+                self.transition(
+                    "checkpoint_identity_blocked", {"phase": "blocked"},
+                    reason="checkpoint_invalid",
+                    checkpoint_identity_error=type(error).__name__,
+                    actor_type="supervisor", intervention_type="checkpoint_validation",
+                )
+                return 2
             if manual_intervention is not None:
                 self.record_manual_intervention(manual_intervention)
                 return 1 if self.stop_requested else 0
@@ -2538,11 +2584,67 @@ Only report repaired when every acceptance requirement is verified.
                 self.stop_process()
 
     @staticmethod
+    def inspect_legacy_attempt_migration(checkpoint: Path, session_id: str,
+                                         target: str) -> dict:
+        """Inspect an exact pending attempt tuple without modifying its checkpoint."""
+        from .attempt_identity_archive import AttemptIdentityArchive
+
+        archive = AttemptIdentityArchive(checkpoint)
+        with _supervisor_owner_lock(), archive.owner():
+            return archive.inspect_legacy_migration(None, target, session_id)
+
+    @staticmethod
+    def authorize_legacy_attempt_migration(checkpoint: Path, session_id: str,
+                                           target: str, checkpoint_sha256: str,
+                                           approved_attempts_sha256: str) -> dict:
+        """Record one explicit owner approval for the exact captured legacy work."""
+        from .attempt_identity_archive import AttemptIdentityArchive
+
+        archive = AttemptIdentityArchive(checkpoint)
+        with _supervisor_owner_lock(), archive.owner():
+            return archive.authorize_legacy_migration(
+                None, target, session_id, checkpoint_sha256,
+                approved_attempts_sha256)
+
+    @staticmethod
     def lock_path() -> Path:
         return Path.home() / ".jev-factorio-supervisor.lock"
 
 
 def cli() -> None:
+    argv = sys.argv[1:]
+    if argv and argv[0] in {
+            "inspect-legacy-attempt-migration",
+            "authorize-legacy-attempt-migration"}:
+        command = argv[0]
+        migration_parser = argparse.ArgumentParser(
+            prog=f"{Path(sys.argv[0]).name} {command}",
+            description=("Inspect or explicitly authorize migration of the exact pending "
+                         "controller attempt captured in an existing checkpoint."))
+        migration_parser.add_argument("--checkpoint", type=Path, required=True)
+        migration_parser.add_argument("--session-id", required=True)
+        migration_parser.add_argument("--target", choices=(
+            "bootstrap_mining", "iron_smelting", "steam_power",
+            "automation_science", "rocket_launch"), required=True)
+        if command == "authorize-legacy-attempt-migration":
+            migration_parser.add_argument("--exact-checkpoint-sha256", required=True)
+            migration_parser.add_argument("--exact-attempt-tuples-sha256", required=True)
+        migration_args = migration_parser.parse_args(argv[1:])
+        checkpoint = Path(os.path.abspath(migration_args.checkpoint))
+        try:
+            if command == "inspect-legacy-attempt-migration":
+                result = Supervisor.inspect_legacy_attempt_migration(
+                    checkpoint, migration_args.session_id, migration_args.target)
+            else:
+                result = Supervisor.authorize_legacy_attempt_migration(
+                    checkpoint, migration_args.session_id, migration_args.target,
+                    migration_args.exact_checkpoint_sha256,
+                    migration_args.exact_attempt_tuples_sha256)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+            migration_parser.error(f"Legacy attempt migration refused: {error}")
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+        return
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--run-id", help="Shared research run ID; immutable once assigned")

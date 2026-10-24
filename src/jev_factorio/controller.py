@@ -18,6 +18,7 @@ import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from functools import wraps
 from uuid import uuid4
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -61,6 +62,38 @@ _ASYNC_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="jev-async-controller",
 )
 _ASYNC_WORKER_LOCAL = threading.local()
+
+
+def _attempt_identity_owned_step(method):
+    """Hold the checkpoint owner across observation, dispatch, and settlement."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        archive = getattr(self, "_attempt_identity_archive", None)
+        if archive is None:
+            return method(self, *args, **kwargs)
+        with archive.owner():
+            archive.validate_current(self.memory_type, self.target)
+            self._attempt_identity_owner = archive
+            try:
+                return method(self, *args, **kwargs)
+            finally:
+                self._attempt_identity_owner = None
+    return wrapped
+
+
+def _dispatch_nonentry_reason(error: BaseException) -> str | None:
+    from .backends.errors import ConnectionPreflightRejected
+    from .backends.native_factory import TransferPreflightRejected
+    from .operational_safety import MaintenanceAdmissionClosed, StoragePressure
+    from .telemetry import DispatchCancelledBeforeEntry
+
+    return {
+        DispatchCancelledBeforeEntry: "cancelled",
+        MaintenanceAdmissionClosed: "maintenance",
+        StoragePressure: "storage",
+        ConnectionPreflightRejected: "connection_preflight",
+        TransferPreflightRejected: "transfer_preflight",
+    }.get(type(error))
 
 
 class AsyncControllerBusy(RuntimeError):
@@ -459,6 +492,16 @@ class HierarchicalLoop(AgentLoop):
         self.log_file = Path(log_file) if log_file else None
         self.checkpoint = Path(checkpoint) if checkpoint else None
         self.resume_controller = resume_controller
+        self._attempt_identity_archive = None
+        self._attempt_identity_owner = None
+        if self.checkpoint is not None:
+            from .attempt_identity_archive import AttemptIdentityArchive
+            self._attempt_identity_archive = AttemptIdentityArchive(self.checkpoint)
+            if resume_controller:
+                # Validate paid-attempt identity before enabling any backend
+                # capability or constructing a provider wrapper.
+                with self._attempt_identity_archive.owner():
+                    self._attempt_identity_archive.validate_current(self.memory_type, target)
         if type(persist_recoverable_blocks) is not bool:
             raise ValueError("Persistent blocked recovery must be a boolean")
         self.persist_recoverable_blocks = persist_recoverable_blocks
@@ -592,6 +635,8 @@ class HierarchicalLoop(AgentLoop):
         self._fuel_history = FuelHistory()
         self.catalog = None
         self._trace = CausalTrace(research_log, "hierarchical", jev, provenance=self.provenance)
+        self._attempt_identity_original_dispatch = self._trace.dispatch
+        self._trace.dispatch = self._dispatch_with_attempt_identity
         self._async_decision_adapter = (
             _AsyncDecisionAdapter(self) if self.async_decisions else None)
         self._trace.metrics = self._performance if self.factory_scheduling == "ready-work" else None
@@ -3049,6 +3094,9 @@ class HierarchicalLoop(AgentLoop):
             **deepcopy(attempt), "outcome": outcome, "finished_tick": snapshot.tick,
             "finished_at_utc": utc_now(), "latency_seconds": latency,
         }
+        archive = self._attempt_identity_owner
+        if archive is not None:
+            finished = archive.prepare_terminal(self.memory, finished)
         self.memory.attempt_outcomes.append(finished)
         if outcome == "verified":
             self._async_bind_verified_attempt(finished)
@@ -3218,8 +3266,27 @@ class HierarchicalLoop(AgentLoop):
         if self._persistence_failed:
             raise RuntimeError("Checkpoint persistence failed; reconstruct before continuing")
         self.memory._checkpoint_metrics = {}
+        archive = self._attempt_identity_archive
+        if archive is not None and self._attempt_identity_owner is not archive:
+            # A few composed callers persist a controller transition outside
+            # step() (for example, an explicit recovery checkpoint).  They must
+            # still use the same serialized owner and validate the old durable
+            # boundary before publishing a new one.
+            with archive.owner():
+                archive.validate_current(self.memory_type, self.target)
+                self._attempt_identity_owner = archive
+                try:
+                    return self._save()
+                finally:
+                    self._attempt_identity_owner = None
         try:
-            self._trace.call("checkpoint_written", lambda: self.memory.save(self.checkpoint),
+            def persist_checkpoint():
+                token = archive.before_checkpoint(self.memory) if archive is not None else None
+                self.memory.save(self.checkpoint)
+                if archive is not None:
+                    archive.after_checkpoint(token, self.memory)
+
+            self._trace.call("checkpoint_written", persist_checkpoint,
                              details={"persisted": self.checkpoint is not None},
                              result=lambda _: {"checkpoint_io": deepcopy(self.memory._checkpoint_metrics)})
         except BaseException:
@@ -3236,6 +3303,9 @@ class HierarchicalLoop(AgentLoop):
     def _clear_plan(self) -> None:
         attempt = self.memory.attempt
         background = getattr(self.memory, "background_attempt", None)
+        archive = self._attempt_identity_owner
+        if attempt is not None and archive is not None:
+            archive.require_safe_plan_clear(self.memory, attempt, background)
         if self.memory.active_plan is not None:
             self._async_close_current_plan_lineage(
                 self.memory.active_plan, self._async_terminal_for_clear(self.memory.active_plan))
@@ -3251,6 +3321,11 @@ class HierarchicalLoop(AgentLoop):
         self._trace.clear_pending()
 
     def _fail_plan(self, reason: str) -> None:
+        attempt = self.memory.attempt
+        archive = self._attempt_identity_owner
+        if attempt is not None and archive is not None:
+            archive.require_safe_plan_clear(
+                self.memory, attempt, getattr(self.memory, "background_attempt", None))
         failed_plan = Plan.from_dict(self.memory.active_plan)
         key = failed_plan.id
         plan_dict = self.memory.active_plan
@@ -3299,6 +3374,57 @@ class HierarchicalLoop(AgentLoop):
                                           "confidence_floor": self.confidence_floor,
                                           "diagnostics": decision.diagnostics,
                                           "selection_support": getattr(self, "_selection_support", {})})
+
+    def _dispatch_with_attempt_identity(self, operation, action, **kwargs):
+        """Persist dispatch entry/return around the exact CausalTrace operation."""
+        archive = self._attempt_identity_owner
+        attempt_id = kwargs.get("attempt_id")
+        if (archive is None or attempt_id is None
+                or kwargs.get("role", "plan") != "plan"):
+            return self._attempt_identity_original_dispatch(operation, action, **kwargs)
+
+        entered = False
+
+        def durable_operation():
+            nonlocal entered
+            try:
+                archive.dispatch_started(self.memory, attempt_id)
+            except BaseException:
+                self._persistence_failed = True
+                raise
+            entered = True
+            try:
+                outcome = operation()
+            except BaseException as error:
+                reason = _dispatch_nonentry_reason(error)
+                if reason is not None:
+                    try:
+                        archive.dispatch_not_entered(self.memory, attempt_id, reason)
+                    except BaseException:
+                        self._persistence_failed = True
+                        raise
+                raise
+            try:
+                archive.dispatch_returned(self.memory, attempt_id)
+            except BaseException:
+                # The mutator returned, so preserve the started row as an
+                # unresolved paid obligation if its receipt cannot be journaled.
+                self._persistence_failed = True
+                raise
+            return outcome
+
+        try:
+            return self._attempt_identity_original_dispatch(durable_operation, action, **kwargs)
+        except BaseException as error:
+            if not entered and not self._persistence_failed:
+                reason = _dispatch_nonentry_reason(error)
+                if reason is not None:
+                    try:
+                        archive.dispatch_not_entered(self.memory, attempt_id, reason)
+                    except BaseException:
+                        self._persistence_failed = True
+                        raise
+            raise
 
     @measured("record")
     def _record(self, before: GameSnapshot, action: str, outcome: str,
@@ -3918,6 +4044,62 @@ class HierarchicalLoop(AgentLoop):
         plan = Plan.from_dict(self.memory.active_plan)
         step = plan.steps[self.memory.step_index]
         pending = self.memory.pending
+        archive = self._attempt_identity_owner
+        terminal_context = (archive.terminal_context(self.memory, self.memory.attempt)
+                            if archive is not None and self.memory.attempt is not None else None)
+        terminal = terminal_context["terminal"] if terminal_context is not None else None
+        if terminal is not None:
+            outcome = terminal["outcome"]
+            if outcome == "verified":
+                currently_verified = step.satisfied(snapshot)
+                if step.action == "factory_connect" and snapshot.world_kind == "fle":
+                    from .connector_checkpoint import pending_owned
+                    currently_verified = currently_verified and pending_owned(self.memory, step)
+                if not currently_verified:
+                    self.memory.status = "uncertain"
+                    self.memory.reason = (
+                        "A durable terminal result no longer matches the current composed observation; "
+                        "the original attempt remains retained without replay"
+                    )
+                    return self._record(snapshot, "observe", self.memory.reason)
+            elif outcome in {"cancelled_before_dispatch", "maintenance_preflight_rejected",
+                             "storage_preflight_rejected", "connection_preflight_rejected"}:
+                expected_reason = {
+                    "cancelled_before_dispatch": "cancelled",
+                    "maintenance_preflight_rejected": "maintenance",
+                    "storage_preflight_rejected": "storage",
+                    "connection_preflight_rejected": "connection_preflight",
+                }[outcome]
+                if (terminal_context["dispatch"] != "not_entered"
+                        or terminal_context["dispatch_reason"] != expected_reason):
+                    self.memory.status = "uncertain"
+                    self.memory.reason = (
+                        "A terminal preflight result lacks its exact durable non-entry witness; "
+                        "the original attempt remains retained"
+                    )
+                    return self._record(snapshot, "observe", self.memory.reason)
+                self._finish_attempt(snapshot, outcome)
+                self.memory.pending = None
+                self._trace.clear_pending()
+                self.memory.event("attempt_terminal_recovered", attempt_id=terminal["id"],
+                                  outcome=outcome, tick=snapshot.tick)
+                if outcome == "connection_preflight_rejected":
+                    reason = "Connection preflight rejected; replan after retaining the original attempt"
+                    self.memory.status = "running"
+                    self._fail_plan(reason)
+                    return self._record(snapshot, "reconcile", reason)
+                return self._record(
+                    snapshot, "observe", "Recovered an exact pre-dispatch terminal result", snapshot)
+            elif outcome not in {
+                    "transfer_preflight_rejected", "rejected_transfer_reconciled",
+                    "partial_transfer_reconciled", "zero_effect_transfer_reconciled",
+                    "wait_replanned", "wait_expired"}:
+                self.memory.status = "uncertain"
+                self.memory.reason = (
+                    "A retained terminal outcome is not eligible for automatic recovery; "
+                    "the original attempt remains retained without replay"
+                )
+                return self._record(snapshot, "observe", self.memory.reason)
         preflight_event = ((self.memory.attempt or {}).get("dispatch_phases") or {}).get("transfer_rpc")
         if isinstance(preflight_event, dict) and preflight_event.get("error_code") == "transfer_preflight_rejected":
             proof = preflight_event.get("proof")
@@ -4013,6 +4195,13 @@ class HierarchicalLoop(AgentLoop):
             self.memory.status = "running"
             self._fail_plan(reason)
             return self._record(snapshot, "reconcile", reason)
+        if terminal is not None and terminal["outcome"] not in {"wait_replanned", "wait_expired"}:
+            self.memory.status = "uncertain"
+            self.memory.reason = (
+                "The exact terminal outcome no longer matches current receipt evidence; "
+                "the original attempt remains retained without replay"
+            )
+            return self._record(snapshot, "observe", self.memory.reason)
         if (not (self._safety and self._safety.maintenance(self.memory, snapshot))
                 and self._prepared_transfer_never_entered_rpc(plan, step, snapshot)):
             return self._dispatch_retained_transfer(plan, step, snapshot)
@@ -4102,6 +4291,13 @@ class HierarchicalLoop(AgentLoop):
             # replay a non-idempotent command after lost acknowledgement.
             self.memory.status = "uncertain"
             self.memory.reason = "Unverified action outcome; inspect/reconcile before another mutation"
+            return self._record(snapshot, "observe", self.memory.reason)
+        if terminal is not None:
+            self.memory.status = "uncertain"
+            self.memory.reason = (
+                "The exact terminal outcome could not be reconciled against current evidence; "
+                "the original attempt remains retained without replay"
+            )
             return self._record(snapshot, "observe", self.memory.reason)
         # In a real backend observation allows game time to elapse naturally.
         # The explicitly synthetic backend advances only when given idle.
@@ -4201,6 +4397,7 @@ class HierarchicalLoop(AgentLoop):
         return min(plans, key=lambda plan: (len(plan.steps), plan.id))
 
     @_serialized_async_actor
+    @_attempt_identity_owned_step
     @traced_step
     def step(self) -> dict:
         self._persistent_recovery_status = None
