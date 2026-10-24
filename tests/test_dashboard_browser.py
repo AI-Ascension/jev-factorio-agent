@@ -8,7 +8,7 @@ import time
 import pytest
 
 playwright = pytest.importorskip("playwright.sync_api", reason="Install .[dashboard-test] for browser tests")
-from jev_factorio.dashboard import DashboardServer, EventWriter, Monitor
+from jev_factorio.dashboard import DashboardServer, EventWriter, Monitor, project_record
 
 
 @pytest.fixture
@@ -689,6 +689,110 @@ def mission_fixture():
     return project_state(mission_state())
 
 
+def mission_fixture_with_automation(counts):
+    from test_dashboard_mission import mission_state
+    from jev_factorio.dashboard import project_state
+
+    state = mission_state()
+    for family, count in zip(("input_routes", "production_sites", "successors"), counts):
+        state["factory"][family] = {
+            "sources": {f"role-{index}": {"phase": "ready"} for index in range(count)}
+        }
+    return project_state(state)
+
+
+@pytest.mark.parametrize(
+    ("counts", "projected_total"),
+    [((0, 0, 0), 0), ((6, 0, 0), 6), ((6, 1, 0), 7), ((6, 6, 0), 12), ((6, 6, 6), 18)],
+    ids=["empty", "one-family-six", "seven-across-families", "twelve-across-families", "eighteen-across-families"],
+)
+def test_actual_producer_family_automation_counts_keep_launch_fresh(live, counts, projected_total):
+    page, writer, url, errors = live
+    page.goto(url)
+    state = mission_fixture_with_automation(counts)
+    writer.emit("observation", 2, state=state)
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch prerequisites observed")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("LATEST CAPTURED OBSERVATION")
+    if projected_total:
+        playwright.expect(page.locator("#mission-automation li")).to_have_count(projected_total)
+    else:
+        playwright.expect(page.locator("#mission-automation li")).to_have_count(1)
+        playwright.expect(page.locator("#mission-automation")).to_contain_text("Automation telemetry unavailable")
+    response = page.request.get(f"{url}/api/snapshot")
+    assert response.ok
+    view = response.json()["view"]
+    assert view["state_observed_time"] is not None
+    assert len(view["state"]["mission"]["automation"]) == projected_total
+    assert not errors
+
+
+def test_valid_full_automation_snapshot_overflow_rejection_and_recovery(live):
+    """All 18 producer rows are valid; seven rows in one family are not."""
+    page, writer, url, errors = live
+    page.goto(url)
+    full = mission_fixture_with_automation((6, 6, 6))
+    writer.emit("observation", 2, state=full)
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch prerequisites observed")
+    playwright.expect(page.locator("#mission-automation li")).to_have_count(18)
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("LATEST CAPTURED OBSERVATION")
+
+    overflow = mission_fixture_with_automation((6, 5, 5))
+    overflow["mission"]["automation"].append({
+        "family": "input_routes", "role": "role-overflow", "state": "ready",
+        "reason": None, "survey_tick": None, "cached": None,
+    })
+    assert len(overflow["mission"]["automation"]) == 17
+    writer.emit("observation", 2, state=overflow)
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch evidence unavailable")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("STALE / DISCONNECTED")
+    response = page.request.get(f"{url}/api/snapshot")
+    assert response.ok
+    rejected = response.json()["view"]
+    assert rejected["state_observed_time"] is None
+    assert "mission" not in rejected["state"]
+
+    recovered = mission_fixture_with_automation((6, 0, 0))
+    writer.emit("observation", 2, state=recovered)
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch prerequisites observed")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("LATEST CAPTURED OBSERVATION")
+    playwright.expect(page.locator("#mission-automation li")).to_have_count(6)
+    assert not errors
+
+
+def test_producer_label_collisions_and_shared_diagnostic_keys_render_in_browser(live):
+    from test_dashboard_mission import mission_state
+    from jev_factorio.dashboard import project_state
+
+    page, writer, url, errors = live
+    page.goto(url)
+    prefix = "r" * 160
+    state = mission_state()
+    state["factory"]["input_routes"] = {
+        "sources": {
+            prefix + "-source-A": {"phase": "ready"},
+            prefix + "-source-B": {"phase": "blocked"},
+        },
+        "diagnostics": {
+            prefix + "-source-A": {"reason": "shared-key diagnostic", "survey_tick": 1000},
+        },
+    }
+    projected = project_state(state)
+    rows = projected["mission"]["automation"]
+    assert len(rows) == 2
+    assert rows[0]["role"] == rows[1]["role"] == prefix
+    assert rows[0]["reason"] == "shared-key diagnostic"
+
+    writer.emit("observation", 2, state=projected)
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch prerequisites observed")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("LATEST CAPTURED OBSERVATION")
+    playwright.expect(page.locator("#mission-automation li")).to_have_count(2)
+    response = page.request.get(f"{url}/api/snapshot")
+    assert response.ok
+    accepted = response.json()["view"]["state"]["mission"]["automation"]
+    assert accepted == rows
+    assert not errors
+
+
 def test_mission_launch_gates_receipt_victory_and_frozen_display(live):
     from test_dashboard_mission import mission_state, receipt
     from jev_factorio.dashboard import project_state
@@ -734,6 +838,138 @@ def test_mission_stale_snapshot_does_not_rejuvenate_on_model_event(live):
         };
     }''')
     assert rendered == {'freshness': 'STALE / DISCONNECTED', 'historical': True}
+    assert not errors
+
+
+def test_copied_mission_projection_cannot_refresh_launch_display(live):
+    from test_research_catalog import DATA_20, raw_catalog
+    from jev_factorio import research_catalog
+
+    page, writer, url, errors = live
+    catalog = raw_catalog(DATA_20, researched=["electronics", "automation-science-pack"])
+    catalog["state"].update({"tick": 5, "current": "automation", "progress": 0.5})
+    research_catalog.write(writer.path.with_name(research_catalog.FILENAME), catalog)
+    page.goto(url)
+
+    current = mission_fixture()
+    writer.emit("observation", 2, state=current)
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch prerequisites observed")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("LATEST CAPTURED OBSERVATION")
+
+    # The mission payload is a copied producer projection from the previous
+    # tick. A new event cannot bind its old launch evidence to current state.
+    stale = {**current, "tick": current["tick"] + 1}
+    writer.emit("observation", 2, state=stale)
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch evidence unavailable")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("STALE / DISCONNECTED")
+
+    response = page.request.get(f"{url}/api/snapshot")
+    assert response.ok
+    view = response.json()["view"]
+    assert view["state_observed_time"] is None
+    assert "mission" not in view["state"]
+    assert view["research"]["status"] == "observation incomplete"
+    assert view["research"]["source"] != "catalog"
+    assert view["research"]["current"] is None
+
+    writer.emit("observation", 2, state=current)
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch prerequisites observed")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("LATEST CAPTURED OBSERVATION")
+    assert not errors
+
+
+def test_explicit_empty_after_state_clears_launch_and_current_research_display(live):
+    from test_dashboard_mission import mission_state
+    from test_research_catalog import DATA_20, raw_catalog
+    from jev_factorio import research_catalog
+
+    page, writer, url, errors = live
+    catalog = raw_catalog(DATA_20, researched=["electronics", "automation-science-pack"])
+    catalog["state"].update({"tick": 5, "current": "automation", "progress": 0.5})
+    research_catalog.write(writer.path.with_name(research_catalog.FILENAME), catalog)
+    page.goto(url)
+    playwright.expect(page.locator("#research-current")).to_have_text("Automation")
+    complete = mission_state()
+    complete["researched"] = ["electronics", "automation-science-pack"]
+    writer.emit("decision_recorded", 7, record=project_record({
+        "after_state": complete, "action": "observe",
+    }))
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch prerequisites observed")
+    playwright.expect(page.locator("#mission-production")).to_contain_text("rocket-silo")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("LATEST CAPTURED OBSERVATION")
+    playwright.expect(page.locator("#research-current")).to_have_text("Rocket silo")
+
+    writer.emit("decision_recorded", 7, record=project_record({
+        "state": complete, "after_state": {}, "action": "observe",
+    }))
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch evidence unavailable")
+    playwright.expect(page.locator("#mission-production")).not_to_contain_text("rocket-silo")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("STALE / DISCONNECTED")
+    playwright.expect(page.locator("#research-strip")).to_be_hidden()
+    response = page.request.get(f"{url}/api/snapshot")
+    assert response.ok
+    research = response.json()["view"]["research"]
+    assert research["status"] == "observation incomplete"
+    assert research["current"] is None
+    assert research["tiers"]
+
+    malformed = dict(complete, tick=1001, researched=["electronics", "automation-science-pack", "rocket-silo", 7])
+    writer.emit("decision_recorded", 7, record=project_record({
+        "state": complete, "after_state": malformed, "action": "observe",
+    }))
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch evidence unavailable")
+    playwright.expect(page.locator("#research-strip")).to_be_hidden()
+    snapshot = page.request.get(f"{url}/api/snapshot")
+    assert snapshot.ok
+    view = snapshot.json()["view"]
+    assert view["state_observed_time"] is None
+    assert view["research"]["status"] == "observation incomplete"
+    assert view["research"]["current"] is None
+    rocket = next(row for row in view["milestones"] if row["key"] == "rocket-silo")
+    assert rocket["state"] != "done"
+    assert not errors
+
+
+@pytest.mark.parametrize(
+    "raw_state",
+    [
+        None,
+        {"tick": 1002, "session_id": "session-481", "world_kind": "fle"},
+    ],
+    ids=["null", "missing-researched"],
+)
+def test_incomplete_raw_observation_clears_current_research_and_mission_display(live, raw_state):
+    from test_dashboard_mission import mission_state
+    from test_research_catalog import DATA_20, raw_catalog
+    from jev_factorio import research_catalog
+
+    page, writer, url, errors = live
+    catalog = raw_catalog(DATA_20, researched=["electronics", "automation-science-pack"])
+    catalog["state"].update({"tick": 5, "current": "automation", "progress": 0.5})
+    research_catalog.write(writer.path.with_name(research_catalog.FILENAME), catalog)
+    page.goto(url)
+    playwright.expect(page.locator("#research-current")).to_have_text("Automation")
+
+    complete = mission_state()
+    complete["researched"] = ["electronics", "automation-science-pack", "rocket-silo"]
+    writer.emit("decision_recorded", 7, record=project_record({
+        "after_state": complete, "action": "observe",
+    }))
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch prerequisites observed")
+    playwright.expect(page.locator("#research-current")).to_have_text("Rocket silo")
+
+    writer.emit("observation", 2, state=raw_state)
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch evidence unavailable")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("STALE / DISCONNECTED")
+    playwright.expect(page.locator("#research-strip")).to_be_hidden()
+    response = page.request.get(f"{url}/api/snapshot")
+    assert response.ok
+    view = response.json()["view"]
+    assert view["state_observed_time"] is None
+    assert view["research"]["status"] == "observation incomplete"
+    assert view["research"]["source"] != "catalog"
+    assert view["research"]["current"] is None
+    assert "mission_record" not in view
     assert not errors
 
 
