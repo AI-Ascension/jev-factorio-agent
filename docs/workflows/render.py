@@ -11,6 +11,7 @@ import re
 import shutil
 import struct
 import subprocess
+import tempfile
 import xml.etree.ElementTree as ET
 
 
@@ -27,7 +28,10 @@ SECTIONS = {
 NODE = re.compile(r'\b([A-Z][A-Z0-9_]*)\s*(\["[^"]*"\]|\{"[^"]*"\})')
 
 
-def split_sections(directory: Path) -> list[Path]:
+def split_sections(directory: Path, only: str | None = None, *,
+                   output_directory: Path | None = None) -> list[Path]:
+    if only is not None and only not in {"00-complete-workflow", *SECTIONS.values()}:
+        raise ValueError("--only must name an existing workflow source")
     complete = directory / "mmd/00-complete-workflow.mmd"
     source = complete.read_text(encoding="utf-8")
     declared = NODE.findall(source)
@@ -37,6 +41,8 @@ def split_sections(directory: Path) -> list[Path]:
     palette = "\n".join(line for line in source.splitlines() if line.startswith("classDef "))
     paths = [complete]
     for section, filename in SECTIONS.items():
+        if only is not None and filename != only:
+            continue
         match = re.search(
             rf"^subgraph {section}\[.*?^end\s*$", source, re.MULTILINE | re.DOTALL
         )
@@ -57,7 +63,8 @@ def split_sections(directory: Path) -> list[Path]:
             )
         section_style = "\n".join(line for line in source.splitlines()
                                   if line.startswith(f"style {section} "))
-        path = directory / "mmd" / f"{filename}.mmd"
+        path = (output_directory or directory) / "mmd" / f"{filename}.mmd"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(("flowchart TD\n\n" + body + "\n" + continuation
                          + "\n" + palette + "\n" + section_style).rstrip() + "\n",
                         encoding="utf-8", newline="\n")
@@ -76,14 +83,14 @@ def main() -> None:
     arguments = parser.parse_args()
     if not math.isfinite(arguments.scale) or arguments.scale <= 0:
         parser.error("--scale must be positive and finite")
-    directory = Path(__file__).resolve().parent
-    sources = split_sections(directory)
-    if arguments.split_only:
-        return
-    if not arguments.mmdc or not arguments.browser:
-        parser.error("--mmdc and --browser are required for rendering")
-    if arguments.only and arguments.only not in {source.stem for source in sources}:
+    if arguments.only and arguments.only not in {"00-complete-workflow", *SECTIONS.values()}:
         parser.error("--only must name an existing workflow source")
+    if not arguments.split_only and (not arguments.mmdc or not arguments.browser):
+        parser.error("--mmdc and --browser are required for rendering")
+    directory = Path(__file__).resolve().parent
+    if arguments.split_only:
+        split_sections(directory, arguments.only)
+        return
     mmdc = Path(arguments.mmdc).resolve()
     # Invoke the Node entry point directly on Windows, avoiding cmd quoting of
     # paths containing spaces. The entry also anchors Puppeteer's module lookup.
@@ -93,12 +100,22 @@ def main() -> None:
     config = json.loads((directory / "mermaid-config.json").read_text(encoding="utf-8"))
     background = config["themeVariables"].get("background", "white")
     workspace = directory.parents[1]
-    temporary = workspace / "runs/mermaid-render/tmp"
-    temporary.mkdir(parents=True, exist_ok=True)
+    scratch_root = workspace / "runs/mermaid-render/tmp"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix="render-", dir=scratch_root))
+    # Stage derivatives and images together. A failed child render must leave
+    # the published sources, images and manifest at their previous revision.
+    sources = split_sections(directory, arguments.only, output_directory=temporary / "sources")
     output = directory / "pngs"
     output.mkdir(exist_ok=True)
     vectors = directory / "svgs"
     vectors.mkdir(exist_ok=True)
+    staged_output = temporary / "pngs"
+    staged_output.mkdir()
+    staged_vectors = temporary / "svgs"
+    staged_vectors.mkdir()
+    publications = []
+    rendered_records = []
     browser_config = temporary / "puppeteer.json"
     browser_config.write_text(json.dumps({
         "executablePath": str(Path(arguments.browser).resolve()),
@@ -122,6 +139,14 @@ def main() -> None:
         environment["FONTCONFIG_FILE"] = str(font_config)
     manifest = output / "manifest.json"
     records = json.loads(manifest.read_text(encoding="utf-8")) if arguments.only and manifest.exists() else []
+    # A partial render must not republish stale evidence for an edited overview
+    # or shared theme, even though it leaves unselected derivatives untouched.
+    config_digest = hashlib.sha256((directory / "mermaid-config.json").read_bytes()).hexdigest()
+    records = [entry for entry in records
+               if (directory / entry["source"]).is_file()
+               and entry.get("source_sha256") == hashlib.sha256(
+                   (directory / entry["source"]).read_bytes()).hexdigest()
+               and entry.get("config_sha256") == config_digest]
     for source in sources:
         if arguments.only and source.stem != arguments.only:
             continue
@@ -141,7 +166,7 @@ def main() -> None:
         ]
         vector = temporary / f"{source.stem}.svg"
         subprocess.run(common + ["-o", str(vector)], check=True, env=environment, timeout=300)
-        published_vector = vectors / vector.name
+        published_vector = staged_vectors / vector.name
         shutil.copyfile(vector, published_vector)
         viewbox = ET.parse(vector).getroot().attrib["viewBox"].split()
         width, height = map(float, viewbox[2:])
@@ -149,7 +174,7 @@ def main() -> None:
             arguments.scale, 30000 / max(width, height),
             math.sqrt(160_000_000 / (width * height)),
         )
-        raster = output / f"{source.stem}.png"
+        raster = staged_output / f"{source.stem}.png"
         from PIL import Image
 
         dimensions = (math.ceil(width * scale), math.ceil(height * scale))
@@ -171,9 +196,9 @@ def main() -> None:
             raise ValueError(f"Invalid PNG: {raster}")
         pixels = struct.unpack(">II", header[16:24])
         record = {
-            "source": source.relative_to(directory).as_posix(),
-            "png": raster.relative_to(directory).as_posix(),
-            "svg": published_vector.relative_to(directory).as_posix(),
+            "source": "mmd/" + source.name,
+            "png": "pngs/" + raster.name,
+            "svg": "svgs/" + published_vector.name,
             "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "config_sha256": hashlib.sha256((directory / "mermaid-config.json").read_bytes()).hexdigest(),
             "effective_config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
@@ -184,9 +209,17 @@ def main() -> None:
         }
         records = [entry for entry in records if entry["source"] != record["source"]]
         records.append(record)
-        print(json.dumps(record), flush=True)
+        if source.stem != "00-complete-workflow":
+            publications.append((source, directory / "mmd" / source.name))
+        publications.extend(((raster, output / raster.name),
+                             (published_vector, vectors / published_vector.name)))
+        rendered_records.append(record)
+    for staged, published in publications:
+        shutil.copyfile(staged, published)
     records.sort(key=lambda entry: entry["source"])
     manifest.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8", newline="\n")
+    for record in rendered_records:
+        print(json.dumps(record), flush=True)
 
 
 if __name__ == "__main__":
