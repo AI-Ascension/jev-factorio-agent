@@ -1,7 +1,0 @@
-{
-  "duration_hours": 24,
-  "factory_scheduling": "ready-work",
-  "background_work": true,
-  "furnace_output_buffers": true,
-  "furnace_input_belts": true
-}

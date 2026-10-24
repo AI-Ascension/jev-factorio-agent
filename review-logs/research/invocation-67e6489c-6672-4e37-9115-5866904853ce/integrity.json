@@ -1,8 +1,0 @@
-{
-  "event_count": 10636,
-  "final_event_hash": "sha256:7d70d1046535430d4f04eb33709ef4e64da24b7581d0d3eb68b5d1c8584f34d0",
-  "manifest_hash": "sha256:8d0d46bd56326848fa453ef1d5fcb76caceb15d411c62b24b7519c8ab9f8e543",
-  "run_id": "f59738c4-dd80-49b5-8b2c-a62cacaa1c15",
-  "schema": "jev-factorio.integrity.v1",
-  "schema_version": 1
-}
