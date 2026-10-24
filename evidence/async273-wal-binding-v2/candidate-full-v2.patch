@@ -1,0 +1,3349 @@
+diff --git a/src/jev_factorio/async_provider.py b/src/jev_factorio/async_provider.py
+index 9e0fb0bb..88ef8b51 100644
+--- a/src/jev_factorio/async_provider.py
++++ b/src/jev_factorio/async_provider.py
+@@ -1,9 +1,10 @@
+ """Bounded, explicit async HTTP transport for one logical Jev provider client.
+ 
+-This module owns only in-memory request admission and an HTTPX connection pool.
+-It does not retry, persist request identity, cancel remote work, or mutate a
+-game. Callers must treat a transport-entered cancellation/timeout as an
+-ambiguous provider outcome and keep their existing durable gates.
++Ordinary calls use only in-memory admission and the HTTPX connection pool. An
++explicit provider decision lease adds durable pre-send and validated-response
++hooks without changing default client/controller factories. Neither path retries,
++cancels remote work, or mutates a game. A transport-entered cancellation/timeout
++remains ambiguous unless the lease already contains the exact validated response.
+ """
+ from __future__ import annotations
+ 
+@@ -350,13 +351,18 @@ class AsyncProviderClient:
+ 
+     async def post_json(self, *, identity: RequestIdentity, url: str,
+                         headers: Mapping[str, str], payload: dict[str, Any],
+-                        deadline: float | None = None) -> tuple[dict[str, Any], str]:
++                        deadline: float | None = None, decision_lease=None,
++                        response_builder=None):
+         if not isinstance(identity, RequestIdentity):
+             raise TypeError("identity must be a RequestIdentity")
+         request_payload = snapshot_json(payload)
+         if not isinstance(request_payload, dict):
+             raise ValueError("provider request payload must be a JSON object")
+         request_sha256 = request_payload_sha256(request_payload)
++        if decision_lease is not None:
++            if response_builder is None:
++                raise TypeError("A WAL-bound request requires an adapter response validator")
++            decision_lease.assert_transport_payload(identity, request_payload, request_sha256)
+         if deadline is None:
+             deadline = time.monotonic() + self.timeout
+         if (not isinstance(deadline, (int, float)) or isinstance(deadline, bool)
+@@ -370,11 +376,27 @@ class AsyncProviderClient:
+             try:
+                 await self._acquire(identity, float(deadline))
+             except asyncio.CancelledError as error:
+-                raise AsyncProviderCancelled(identity, NOT_SENT) from error
++                failure = AsyncProviderCancelled(identity, NOT_SENT)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, NOT_SENT)
++                raise failure from error
++            except AsyncProviderLocalError as error:
++                if decision_lease is not None:
++                    decision_lease.record_failure(error, NOT_SENT)
++                raise
+             acquired = True
+             remaining = float(deadline) - time.monotonic()
+             if remaining <= 0:
+-                raise AsyncProviderDeadlineExceeded("provider request deadline expired", identity)
++                failure = AsyncProviderDeadlineExceeded(
++                    "provider request deadline expired", identity)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, NOT_SENT)
++                raise failure
++
++            # The WAL write is the last synchronous operation before HTTPX
++            # entry. If it fails, the provider coroutine is never constructed.
++            if decision_lease is not None:
++                decision_lease.mark_may_have_been_sent()
+ 
+             try:
+                 # Entering HTTPX is the conservative ambiguity boundary. HTTPX
+@@ -386,31 +408,69 @@ class AsyncProviderClient:
+                     timeout=remaining,
+                 )
+             except asyncio.CancelledError as error:
+-                raise AsyncProviderCancelled(identity, MAY_HAVE_BEEN_SENT) from error
++                failure = AsyncProviderCancelled(identity, MAY_HAVE_BEEN_SENT)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, MAY_HAVE_BEEN_SENT)
++                raise failure from error
+             # Once HTTPX is entered, even a connect/pool failure can happen
+             # after a redirect response from an earlier POST hop. Without
+             # tracking each redirect response boundary, classify every
+             # transport exception conservatively as possibly sent.
+             except httpx.TimeoutException as error:
+-                raise AsyncProviderTimeout(identity, MAY_HAVE_BEEN_SENT) from error
++                failure = AsyncProviderTimeout(identity, MAY_HAVE_BEEN_SENT)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, MAY_HAVE_BEEN_SENT)
++                raise failure from error
+             except asyncio.TimeoutError as error:
+-                raise AsyncProviderTimeout(identity, MAY_HAVE_BEEN_SENT) from error
++                failure = AsyncProviderTimeout(identity, MAY_HAVE_BEEN_SENT)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, MAY_HAVE_BEEN_SENT)
++                raise failure from error
+             except httpx.ConnectError as error:
+-                raise AsyncProviderConnectionError(identity, MAY_HAVE_BEEN_SENT) from error
++                failure = AsyncProviderConnectionError(identity, MAY_HAVE_BEEN_SENT)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, MAY_HAVE_BEEN_SENT)
++                raise failure from error
+             except httpx.TransportError as error:
+-                raise AsyncProviderConnectionError(identity, MAY_HAVE_BEEN_SENT) from error
++                failure = AsyncProviderConnectionError(identity, MAY_HAVE_BEEN_SENT)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, MAY_HAVE_BEEN_SENT)
++                raise failure from error
+ 
+             delivery_phase = RESPONSE_RECEIVED
+             if time.monotonic() > float(deadline):
+-                raise AsyncProviderTimeout(identity, MAY_HAVE_BEEN_SENT)
++                failure = AsyncProviderTimeout(identity, MAY_HAVE_BEEN_SENT)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, MAY_HAVE_BEEN_SENT)
++                raise failure
+             if response.is_error:
+-                raise AsyncProviderHTTPError(response.status_code, response.headers, identity)
++                failure = AsyncProviderHTTPError(
++                    response.status_code, response.headers, identity)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, RESPONSE_RECEIVED)
++                raise failure
+             try:
+                 body = response.json()
+             except (ValueError, TypeError) as error:
+-                raise AsyncProviderPayloadError(identity) from error
++                failure = AsyncProviderPayloadError(identity)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, RESPONSE_RECEIVED)
++                raise failure from error
+             if not isinstance(body, dict):
+-                raise AsyncProviderPayloadError(identity)
++                failure = AsyncProviderPayloadError(identity)
++                if decision_lease is not None:
++                    decision_lease.record_failure(failure, RESPONSE_RECEIVED)
++                raise failure
++            if decision_lease is not None:
++                try:
++                    result = response_builder(body, request_sha256)
++                except BaseException as error:
++                    decision_lease.record_failure(error, RESPONSE_RECEIVED)
++                    raise
++                # Persist validated immutable answers before _release can
++                # raise deferred cancellation and before health clears flight.
++                decision_lease.save_response(result)
++                return result
+             return body, request_sha256
+         except BaseException:
+             operation_failed = True
+diff --git a/src/jev_factorio/decision_lease.py b/src/jev_factorio/decision_lease.py
+new file mode 100644
+index 00000000..5cca45dc
+--- /dev/null
++++ b/src/jev_factorio/decision_lease.py
+@@ -0,0 +1,278 @@
++"""Opt-in binding between one async provider call, health gate, and decision WAL.
++
++This module does not authorize a game action or consume a saved answer. The
++controller integration stage must consume only after its selected plan is
++durable. Credentials and HTTP headers are deliberately absent from this API.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++from dataclasses import dataclass
++from email.utils import parsedate_to_datetime
++from pathlib import Path
++from types import MappingProxyType
++from typing import Any
++
++from .provider_decision_wal import (
++    MAY_HAVE_BEEN_SENT,
++    NOT_SENT,
++    RESPONSE_RECEIVED,
++    DecisionRecord,
++    ProviderDecisionIdentity,
++    ProviderDecisionWAL,
++    WALNotFound,
++    canonical_sha256,
++)
++
++
++def _copy_json(value: Any) -> Any:
++    encoded = json.dumps(value, ensure_ascii=False, allow_nan=False,
++                         sort_keys=True, separators=(",", ":"))
++    return json.loads(encoded)
++
++
++def _freeze(value: Any) -> Any:
++    if type(value) is dict:
++        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
++    if type(value) is list:
++        return tuple(_freeze(item) for item in value)
++    return value
++
++
++def _thaw(value: Any) -> Any:
++    if isinstance(value, MappingProxyType):
++        return {key: _thaw(item) for key, item in value.items()}
++    if isinstance(value, tuple):
++        return [_thaw(item) for item in value]
++    return value
++
++
++def _retry_after(error, now: float) -> tuple[dict | None, int | None]:
++    response = getattr(error, "response", None)
++    status = getattr(response, "status_code", None)
++    if type(status) is not int or not 100 <= status <= 599:
++        status = None
++    headers = getattr(response, "headers", None)
++    if headers is None:
++        return None, status
++    raw = headers.get("Retry-After")
++    if raw is None:
++        return None, status
++    try:
++        seconds = float(raw)
++        if not math.isfinite(seconds):
++            return None, status
++        seconds = min(3600.0, max(0.0, seconds))
++    except (ValueError, TypeError):
++        try:
++            retry_at = parsedate_to_datetime(raw).timestamp()
++            seconds = min(3600.0, max(0.0, retry_at - now))
++        except (ValueError, TypeError, OverflowError):
++            return None, status
++    return {"received_at": float(now), "retry_after_seconds": seconds}, status
++
++
++@dataclass(frozen=True, slots=True)
++class ProviderDecisionLease:
++    """Immutable exact-request lease used by an explicitly WAL-bound call."""
++
++    wal: ProviderDecisionWAL
++    identity: ProviderDecisionIdentity
++    request_identity: Any
++    request_json: str
++    wal_request_json: str
++    request_sha256: str
++    request_payload_sha256: str
++    health_state_sha256: str
++    wal_id: str
++    provider_id: str
++    model_id: str
++    trace_binding: Any
++    clock: Any
++
++    @classmethod
++    def prepare(cls, wal: ProviderDecisionWAL, client, state: dict,
++                questions: dict, *, identity, clock,
++                health_state_sha256: str) -> ProviderDecisionLease:
++        if not isinstance(wal, ProviderDecisionWAL):
++            raise TypeError("wal must be a ProviderDecisionWAL")
++        prepare_payload = getattr(client, "prepare_decision_payload", None)
++        provider_identity = getattr(client, "decision_provider_id", None)
++        if not callable(prepare_payload) or not callable(provider_identity):
++            raise TypeError("Provider client does not support decision leases")
++        payload = _copy_json(prepare_payload(state, questions))
++        if type(payload) is not dict:
++            raise ValueError("Prepared provider payload must be a JSON object")
++        model = getattr(client, "model", None)
++        if type(model) is not str or not model.strip():
++            raise ValueError("Decision lease requires a pinned provider model")
++        provider_id = provider_identity()
++        if type(provider_id) is not str:
++            raise ValueError("Decision lease requires a sanitized provider identity")
++        request_identity = identity
++        binding = ProviderDecisionIdentity(
++            session_id=identity.session_id,
++            actor_id=identity.actor_id,
++            observation_id=identity.observation_id,
++            decision_id=identity.decision_id,
++            request_id=identity.request_id,
++            provider_id=provider_id,
++            model_id=model,
++        )
++        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False,
++                             sort_keys=True, separators=(",", ":"))
++        payload_digest = canonical_sha256(payload)
++        trace_binding = None
++        trace_prepare = getattr(client, "prepare_decision_trace_binding", None)
++        if callable(trace_prepare):
++            trace_binding = trace_prepare(identity)
++            if trace_binding is not None and (
++                    type(trace_binding) is not dict or set(trace_binding) != {
++                    "session_id", "actor_id", "observation_id", "decision_id",
++                    "model_call_id"}):
++                raise ValueError("Causal trace binding is malformed")
++            if (trace_binding is not None and any(
++                    type(value) is not str or not value.strip()
++                    for value in trace_binding.values())):
++                raise ValueError("Causal trace binding identifiers must be non-empty")
++        wal_request = {"provider_payload_sha256": payload_digest,
++                       "trace_binding": trace_binding,
++                       "health_state_sha256": health_state_sha256}
++        wal_request_json = json.dumps(
++            wal_request, ensure_ascii=False, allow_nan=False,
++            sort_keys=True, separators=(",", ":"),
++        )
++        request_digest = canonical_sha256(wal_request)
++        wal_id = hashlib.sha256(str(Path(wal.path).resolve()).encode("utf-8")).hexdigest()
++        if not callable(clock) or not math.isfinite(float(clock())):
++            raise ValueError("Decision lease requires a finite wall-clock source")
++        return cls(wal, binding, request_identity, encoded, wal_request_json,
++                   request_digest, payload_digest, health_state_sha256, wal_id,
++                   provider_id, model,
++                   _freeze(trace_binding) if trace_binding is not None else None, clock)
++
++    @property
++    def payload(self) -> dict:
++        return json.loads(self.request_json)
++
++    @property
++    def frozen_payload(self):
++        return _freeze(self.payload)
++
++    @property
++    def wal_request(self) -> dict:
++        return json.loads(self.wal_request_json)
++
++    def binding(self) -> dict:
++        return {
++            "wal_id": self.wal_id,
++            "identity": self.identity.to_dict(),
++            "request_sha256": self.request_sha256,
++            "health_state_sha256": self.health_state_sha256,
++        }
++
++    def assert_call(self, client, state: dict, questions: dict, identity) -> None:
++        if identity != self.request_identity:
++            raise ValueError("Decision lease request identity changed")
++        prepare_payload = getattr(client, "prepare_decision_payload", None)
++        provider_identity = getattr(client, "decision_provider_id", None)
++        if not callable(prepare_payload) or not callable(provider_identity):
++            raise TypeError("Provider client does not support decision leases")
++        current_payload = _copy_json(prepare_payload(state, questions))
++        model = getattr(client, "model", None)
++        trace_binding = None
++        trace_prepare = getattr(client, "prepare_decision_trace_binding", None)
++        if callable(trace_prepare):
++            trace_binding = trace_prepare(identity)
++        if (current_payload != self.payload
++                or canonical_sha256(current_payload) != self.request_payload_sha256
++                or provider_identity() != self.provider_id or model != self.model_id
++                or trace_binding != _thaw(self.trace_binding)):
++            raise ValueError("Decision lease provider configuration or request changed")
++
++    def assert_transport_payload(self, identity, payload: dict,
++                                 payload_sha256: str) -> None:
++        if (identity != self.request_identity or payload != self.payload
++                or payload_sha256 != self.request_payload_sha256
++                or payload_sha256 != canonical_sha256(payload)):
++            raise ValueError("Provider transport payload differs from its decision lease")
++
++    def reserve(self) -> DecisionRecord:
++        return self.wal.reserve(self.identity, self.wal_request)
++
++    def inspect(self) -> DecisionRecord:
++        return self.wal.inspect(self.identity, self.wal_request)
++
++    def inspect_optional(self) -> DecisionRecord | None:
++        try:
++            return self.inspect()
++        except WALNotFound:
++            return None
++
++    def mark_may_have_been_sent(self) -> DecisionRecord:
++        return self.wal.mark_may_have_been_sent(self.identity, self.wal_request)
++
++    def save_response(self, result) -> DecisionRecord:
++        if result.identity != self.request_identity:
++            raise ValueError("Provider result identity changed before WAL save")
++        if result.request_payload_sha256 != self.request_payload_sha256:
++            raise ValueError("Provider result request digest changed before WAL save")
++        value = {
++            "answers": _thaw(result.answers),
++            "usage": _thaw(result.usage),
++            "requested_model": result.requested_model,
++            "resolved_model": _thaw(result.resolved_model),
++        }
++        return self.wal.save_response(self.identity, self.wal_request, value)
++
++    def recover_result(self, record: DecisionRecord | None = None):
++        from .async_provider import make_result
++
++        saved = self.wal.recover_response(self.identity, self.wal_request) if record is None else record
++        if saved.state != "response_received" or saved.result is None:
++            raise ValueError("Decision WAL does not contain an unconsumed response")
++        result = _thaw(saved.result)
++        return make_result(
++            self.request_identity,
++            result["answers"], result["usage"], result["requested_model"],
++            result["resolved_model"], self.request_payload_sha256,
++        )
++
++    def record_failure(self, error: BaseException, phase: str) -> DecisionRecord:
++        from .async_provider import (
++            AsyncProviderCancelled,
++            AsyncProviderConnectionError,
++            AsyncProviderDeadlineExceeded,
++            AsyncProviderLocalError,
++            AsyncProviderPayloadError,
++            AsyncProviderTimeout,
++        )
++        from .provider_health import category
++
++        if phase not in {NOT_SENT, MAY_HAVE_BEEN_SENT, RESPONSE_RECEIVED}:
++            raise ValueError("Unsupported provider delivery phase")
++        http_status = None
++        cooldown = None
++        if isinstance(error, AsyncProviderLocalError) or phase == NOT_SENT:
++            error_category = "local_admission"
++        elif isinstance(error, AsyncProviderCancelled):
++            error_category = "unknown_outcome" if phase != NOT_SENT else "local_admission"
++        elif isinstance(error, AsyncProviderPayloadError):
++            error_category = "application_schema"
++        elif isinstance(error, (AsyncProviderTimeout, AsyncProviderConnectionError)):
++            error_category = "service_network"
++        else:
++            error_category = category(error) or "unknown_outcome"
++        if phase == RESPONSE_RECEIVED and getattr(error, "response", None) is not None:
++            try:
++                now = float(self.clock())
++            except (TypeError, ValueError, OverflowError):
++                now = float("nan")
++            if math.isfinite(now):
++                cooldown, http_status = _retry_after(error, now)
++        return self.wal.record_error(
++            self.identity, self.wal_request, error_category, phase,
++            cooldown=cooldown, http_status=http_status,
++        )
+diff --git a/src/jev_factorio/jev_client.py b/src/jev_factorio/jev_client.py
+index ddd41b14..124239b2 100644
+--- a/src/jev_factorio/jev_client.py
++++ b/src/jev_factorio/jev_client.py
+@@ -8,10 +8,13 @@ Gateway:     Vercel AI Gateway, model id "typesafe-ai/jev",
+ from __future__ import annotations
+ 
+ import asyncio
++import hashlib
++import json
+ import math
+ import os
+ import time
+ from collections.abc import Mapping
++from urllib.parse import urlsplit, urlunsplit
+ 
+ import requests
+ 
+@@ -21,6 +24,8 @@ from .async_provider import (
+     AsyncProviderPayloadError,
+     AsyncProviderQueueFull,
+     AsyncProviderResult,
++    NOT_SENT,
++    RESPONSE_RECEIVED,
+     RequestIdentity,
+     make_result,
+     request_payload_sha256,
+@@ -32,6 +37,33 @@ API_URL = "https://api.typesafe.ai/v1/systemone"
+ GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/systemone"  # confirm path against Gateway docs
+ 
+ 
++def _decision_provider_id(provider: str, endpoint: str) -> str:
++    """Fingerprint only the non-secret endpoint; credentials never enter WAL."""
++    if type(endpoint) is not str or not endpoint:
++        raise ValueError("Provider endpoint is not configured")
++    parsed = urlsplit(endpoint)
++    if parsed.username is not None or parsed.password is not None or parsed.query:
++        raise ValueError("Decision leases do not accept credential-bearing endpoints")
++    safe_endpoint = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(),
++                                parsed.path, "", ""))
++    value = json.dumps([provider, safe_endpoint], ensure_ascii=False,
++                       separators=(",", ":"))
++    return provider + ":sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
++
++
++def _validated_async_result(identity, answers, usage, requested_model,
++                            resolved_model, payload_sha256, questions, quantum):
++    if not isinstance(answers, dict):
++        raise AsyncProviderPayloadError(identity)
++    from .judgments import InvalidJudgment, validate_answers
++    try:
++        validate_answers(questions, answers, quantum=quantum)
++    except InvalidJudgment as error:
++        raise AsyncProviderPayloadError(identity, "Provider answer schema rejected") from error
++    return make_result(identity, answers, usage, requested_model,
++                       resolved_model, payload_sha256)
++
++
+ class JevClient:
+     uses_http_provider = True
+     answer_quantum = 0.01
+@@ -172,16 +204,37 @@ class AsyncJevClient(AsyncProviderClient):
+         self.base_url = base_url
+         self.model = model
+ 
++    def decision_provider_id(self) -> str:
++        return _decision_provider_id("typesafe", self.base_url)
++
++    def prepare_decision_payload(self, state: dict, questions: dict) -> dict:
++        return snapshot_json({"state": state, "model": self.model,
++                              "questions": questions})
++
+     async def evaluate(self, state: dict, questions: dict, *, identity: RequestIdentity,
+-                       deadline: float | None = None) -> AsyncProviderResult:
++                       deadline: float | None = None,
++                       decision_lease=None) -> AsyncProviderResult:
+         requested_model = self.model
+-        body, payload_sha256 = await self.post_json(
++        payload = self.prepare_decision_payload(state, questions)
++
++        def build_result(body, payload_sha256):
++            return _validated_async_result(
++                identity, body.get("answers"), body.get("usage"), requested_model,
++                body.get("model"), payload_sha256, questions, self.answer_quantum,
++            )
++
++        posted = await self.post_json(
+             identity=identity,
+             url=self.base_url,
+             headers={"Authorization": f"Bearer {self.api_key}"},
+-            payload={"state": state, "model": requested_model, "questions": questions},
++            payload=payload,
+             deadline=deadline,
++            decision_lease=decision_lease,
++            response_builder=build_result if decision_lease is not None else None,
+         )
++        if decision_lease is not None:
++            return posted
++        body, payload_sha256 = posted
+         answers = body.get("answers")
+         if not isinstance(answers, dict):
+             raise AsyncProviderPayloadError(identity)
+@@ -203,19 +256,46 @@ class AsyncCloudflareJevClient(AsyncProviderClient):
+         self.url = (f"https://api.cloudflare.com/client/v4/accounts/"
+                     f"{account_id}/ai/run")
+ 
++    def decision_provider_id(self) -> str:
++        return _decision_provider_id("cloudflare", self.url)
++
++    def prepare_decision_payload(self, state: dict, questions: dict) -> dict:
++        return snapshot_json({"model": self.model,
++                              "input": {"state": state, "questions": questions}})
++
+     async def evaluate(self, state: dict, questions: dict, *, identity: RequestIdentity,
+-                       deadline: float | None = None) -> AsyncProviderResult:
++                       deadline: float | None = None,
++                       decision_lease=None) -> AsyncProviderResult:
+         requested_model = self.model
+-        body, payload_sha256 = await self.post_json(
++        payload = self.prepare_decision_payload(state, questions)
++
++        def build_result(body, payload_sha256):
++            result = body.get("result")
++            if body.get("success") is not True or not isinstance(result, dict):
++                raise AsyncProviderPayloadError(
++                    identity, "Provider rejected application request")
++            return _validated_async_result(
++                identity, result.get("answers"), result.get("usage"), requested_model,
++                result.get("model"), payload_sha256, questions,
++                getattr(self, "answer_quantum", 0),
++            )
++
++        posted = await self.post_json(
+             identity=identity,
+             url=self.url,
+             headers={"Authorization": f"Bearer {self.api_token}"},
+-            payload={"model": requested_model, "input": {"state": state, "questions": questions}},
++            payload=payload,
+             deadline=deadline,
++            decision_lease=decision_lease,
++            response_builder=build_result if decision_lease is not None else None,
+         )
++        if decision_lease is not None:
++            return posted
++        body, payload_sha256 = posted
+         result = body.get("result")
+         if body.get("success") is not True or not isinstance(result, dict):
+-            raise AsyncProviderPayloadError(identity, "Provider rejected application request")
++            raise AsyncProviderPayloadError(
++                identity, "Provider rejected application request")
+         answers = result.get("answers")
+         if not isinstance(answers, dict):
+             raise AsyncProviderPayloadError(identity)
+@@ -229,19 +309,45 @@ class AsyncMockJevClient:
+     is_mock = True
+     model = MockJevClient.model
+ 
++    def decision_provider_id(self) -> str:
++        return "mock:sha256:" + hashlib.sha256(b"jev-factorio-mock-v1").hexdigest()
++
++    def prepare_decision_payload(self, state: dict, questions: dict) -> dict:
++        return snapshot_json({"state": state, "model": self.model,
++                              "questions": questions})
++
+     async def evaluate(self, state: dict, questions: dict, *, identity: RequestIdentity,
+-                       deadline: float | None = None) -> AsyncProviderResult:
++                       deadline: float | None = None,
++                       decision_lease=None) -> AsyncProviderResult:
+         if deadline is not None:
+             if (not isinstance(deadline, (int, float)) or isinstance(deadline, bool)
+                     or not math.isfinite(deadline)):
+                 raise ValueError("deadline must be an absolute finite monotonic timestamp")
+             if deadline <= time.monotonic():
+-                raise AsyncProviderDeadlineExceeded("provider request deadline expired", identity)
+-        request = {"state": state, "model": self.model, "questions": questions}
+-        snapshot = snapshot_json(request)
++                error = AsyncProviderDeadlineExceeded(
++                    "provider request deadline expired", identity)
++                if decision_lease is not None:
++                    decision_lease.record_failure(error, NOT_SENT)
++                raise error
++        snapshot = self.prepare_decision_payload(state, questions)
++        if decision_lease is not None:
++            decision_lease.mark_may_have_been_sent()
+         answers = MockJevClient().evaluate(snapshot["state"], snapshot["questions"])
+-        return make_result(identity, answers, None, self.model, self.model,
+-                           request_payload_sha256(snapshot))
++        if decision_lease is None:
++            return make_result(identity, answers, None, self.model, self.model,
++                               request_payload_sha256(snapshot))
++        try:
++            result = _validated_async_result(
++                identity, answers, None, self.model, self.model,
++                request_payload_sha256(snapshot), questions, 0,
++            )
++        except AsyncProviderPayloadError as error:
++            if decision_lease is not None:
++                decision_lease.record_failure(error, RESPONSE_RECEIVED)
++            raise
++        if decision_lease is not None:
++            decision_lease.save_response(result)
++        return result
+ 
+     async def aclose(self) -> None:
+         return None
+@@ -268,8 +374,32 @@ class AsyncTracedClient:
+     def __getattr__(self, name):
+         return getattr(self._client, name)
+ 
++    def prepare_decision_trace_binding(self, identity: RequestIdentity):
++        trace = self._trace
++        if not trace.enabled:
++            return None
++        if trace._failed:
++            from .research_log import ResearchLogError
++
++            raise ResearchLogError("Causal trace has failed")
++        self._require_context(identity)
++        if trace._async_provider_call is not None:
++            from .research_log import ResearchLogError
++
++            raise ResearchLogError("Causal trace already has an async provider call")
++        # This deterministic model-call identity survives restart and is kept
++        # separate from the trace's transient event counter.
++        return {
++            "session_id": identity.session_id,
++            "actor_id": identity.actor_id,
++            "observation_id": identity.observation_id,
++            "decision_id": identity.decision_id,
++            "model_call_id": "model-request:" + identity.request_id,
++        }
++
+     async def evaluate(self, state: dict, questions: dict, *, identity: RequestIdentity,
+-                       deadline: float | None = None) -> AsyncProviderResult:
++                       deadline: float | None = None,
++                       decision_lease=None) -> AsyncProviderResult:
+         if not isinstance(identity, RequestIdentity):
+             raise TypeError("identity must be a RequestIdentity")
+         if (deadline is not None
+@@ -282,7 +412,8 @@ class AsyncTracedClient:
+         state, questions = request["state"], request["questions"]
+         trace = self._trace
+         if not trace.enabled:
+-            result = await self._evaluate(state, questions, identity, deadline)
++            result = await self._evaluate(
++                state, questions, identity, deadline, decision_lease)
+             if (not isinstance(result, AsyncProviderResult)
+                     or result.identity != identity):
+                 raise AsyncProviderPayloadError(
+@@ -304,7 +435,10 @@ class AsyncTracedClient:
+             reservation = trace._reserve_async_provider_call()
+             model_call_id = None
+             try:
+-                trace.model_call_id = trace.identity("model")
++                if decision_lease is not None and decision_lease.trace_binding is not None:
++                    trace.model_call_id = decision_lease.trace_binding["model_call_id"]
++                else:
++                    trace.model_call_id = trace.identity("model")
+                 model_call_id = trace.model_call_id
+                 provider_identity = self._identity_payload(identity)
+                 requested_model = getattr(self._client, "model", None)
+@@ -323,7 +457,8 @@ class AsyncTracedClient:
+                     raise ResearchLogError(
+                         "Causal context changed before an async provider request")
+                 try:
+-                    result = await self._evaluate(state, questions, identity, deadline)
++                    result = await self._evaluate(
++                        state, questions, identity, deadline, decision_lease)
+                     if not self._context_matches(identity, model_call_id):
+                         from .research_log import ResearchLogError
+ 
+@@ -359,11 +494,17 @@ class AsyncTracedClient:
+             finally:
+                 trace._release_async_provider_call(reservation)
+ 
+-    async def _evaluate(self, state, questions, identity, deadline):
++    async def _evaluate(self, state, questions, identity, deadline, decision_lease=None):
+         async_method = getattr(self._client, "evaluate_async", None)
+         if callable(async_method):
+-            return await async_method(state, questions, identity=identity, deadline=deadline)
+-        return await self._client.evaluate(state, questions, identity=identity, deadline=deadline)
++            kwargs = {"identity": identity, "deadline": deadline}
++            if decision_lease is not None:
++                kwargs["decision_lease"] = decision_lease
++            return await async_method(state, questions, **kwargs)
++        kwargs = {"identity": identity, "deadline": deadline}
++        if decision_lease is not None:
++            kwargs["decision_lease"] = decision_lease
++        return await self._client.evaluate(state, questions, **kwargs)
+ 
+     def _require_context(self, identity: RequestIdentity) -> None:
+         trace = self._trace
+diff --git a/src/jev_factorio/provider_decision_wal.py b/src/jev_factorio/provider_decision_wal.py
+index bb33832e..ed7fdb80 100644
+--- a/src/jev_factorio/provider_decision_wal.py
++++ b/src/jev_factorio/provider_decision_wal.py
+@@ -1,10 +1,13 @@
+-"""Unused, bounded write-ahead ledger for future provider-decision replay.
+-
+-This module is deliberately not wired into the synchronous or asynchronous
+-controller. It records a request fingerprint and a small, validated answer
+-projection; it never stores request bodies, headers, raw provider responses,
+-game-action attempts, or arbitrary exception text. Credential-like result field
+-names are rejected, and callers must pass only secret-free answer values.
++"""Bounded opt-in write-ahead ledger for async provider decision recovery.
++
++The explicit lease path binds provider transport and health accounting to this
++ledger, but the normal client/controller factories remain unchanged. It records
++request fingerprints and a small validated answer projection; it never stores
++request bodies, headers, raw provider responses, game-action attempts, or
++arbitrary exception text. Credential-like field names are rejected, and callers
++must pass only secret-free answer values. A saved answer is not an action or a
++selected plan and remains unconsumed until a future controller integration
++durably selects one.
+ """
+ from __future__ import annotations
+ 
+@@ -228,6 +231,8 @@ class DecisionRecord:
+     result: Any
+     error_category: str | None
+     event_count: int
++    cooldown: Any = None
++    http_status: int | None = None
+ 
+ 
+ def _freeze(value: Any) -> Any:
+@@ -494,6 +499,31 @@ def _validate_result(value: Any, identity: ProviderDecisionIdentity) -> tuple[di
+     return detached, hashlib.sha256(encoded).hexdigest()
+ 
+ 
++def _validate_cooldown(value: Any, *, category: str, phase: str) -> dict | None:
++    """Accept only a parsed Retry-After projection, never response headers."""
++    if value is None:
++        return None
++    if (type(value) is not dict or set(value) != {"received_at", "retry_after_seconds"}
++            or phase != RESPONSE_RECEIVED or category == "local_admission"):
++        raise ValueError("Invalid provider cooldown projection")
++    received_at = value["received_at"]
++    seconds = value["retry_after_seconds"]
++    if (type(received_at) not in (int, float) or not math.isfinite(received_at)
++            or received_at < 0 or received_at > 253402300799
++            or type(seconds) not in (int, float) or not math.isfinite(seconds)
++            or seconds < 0 or seconds > 3600):
++        raise ValueError("Provider cooldown projection is outside its bound")
++    return {"received_at": float(received_at), "retry_after_seconds": float(seconds)}
++
++
++def _validate_http_status(value: Any, *, phase: str) -> int | None:
++    if value is None:
++        return None
++    if type(value) is not int or not 100 <= value <= 599 or phase != RESPONSE_RECEIVED:
++        raise ValueError("Invalid provider HTTP status projection")
++    return value
++
++
+ def _validate_document(document: Any) -> dict:
+     if type(document) is not dict or set(document) != {
+         "schema", "last_sequence", "records", "ledger_sha256",
+@@ -552,9 +582,20 @@ def _validate_document(document: Any) -> dict:
+                 "dispatch_authorized": {"sequence", "kind", "phase", "previous_event_sha256", "event_sha256"},
+                 "response_saved": {"sequence", "kind", "phase", "previous_event_sha256", "result_sha256", "event_sha256"},
+                 "consumed": {"sequence", "kind", "phase", "previous_event_sha256", "result_sha256", "event_sha256"},
+-                "failed": {"sequence", "kind", "phase", "previous_event_sha256", "error_category", "event_sha256"},
++                "failed": {
++                    frozenset({"sequence", "kind", "phase", "previous_event_sha256",
++                               "error_category", "event_sha256"}),
++                    frozenset({"sequence", "kind", "phase", "previous_event_sha256",
++                               "error_category", "cooldown", "event_sha256"}),
++                    frozenset({"sequence", "kind", "phase", "previous_event_sha256",
++                               "error_category", "http_status", "event_sha256"}),
++                    frozenset({"sequence", "kind", "phase", "previous_event_sha256",
++                               "error_category", "cooldown", "http_status", "event_sha256"}),
++                },
+             }.get(kind)
+-            if fields is None or set(event) != fields:
++            if fields is None or (
++                    frozenset(event) not in fields if kind == "failed"
++                    else set(event) != fields):
+                 raise WALIntegrityError("Unknown or malformed provider decision transition")
+             sequence = event["sequence"]
+             if (type(sequence) is not int or sequence < 1 or sequence in sequences
+@@ -610,6 +651,19 @@ def _validate_document(document: Any) -> dict:
+                     raise WALIntegrityError("Invalid provider failure category")
+                 if phase != NOT_SENT and error_category == "local_admission":
+                     raise WALIntegrityError("Local admission failure cannot follow send admission")
++                try:
++                    cooldown = _validate_cooldown(
++                        event.get("cooldown"), category=error_category, phase=phase,
++                    )
++                    http_status = _validate_http_status(
++                        event.get("http_status"), phase=phase,
++                    )
++                except (TypeError, ValueError, OverflowError) as error:
++                    raise WALIntegrityError("Invalid provider error projection") from error
++                if ("cooldown" in event) != (cooldown is not None):
++                    raise WALIntegrityError("Provider cooldown projection is incomplete")
++                if ("http_status" in event) != (http_status is not None):
++                    raise WALIntegrityError("Provider HTTP status projection is incomplete")
+             elif index > 0:
+                 raise WALIntegrityError("Illegal provider decision transition")
+             previous_hash = event_hash
+@@ -655,7 +709,7 @@ def _validate_document(document: Any) -> dict:
+ 
+ 
+ class ProviderDecisionWAL:
+-    """Atomic, bounded provider request/result ledger; intentionally not wired.
++    """Atomic, bounded provider request/result ledger for explicit leases.
+ 
+     One transition is atomically replaced and fsynced while holding a
+     fail-fast process lock. No API deletes or compacts records. A MAY_HAVE_BEEN_SENT
+@@ -766,11 +820,15 @@ class ProviderDecisionWAL:
+         result_hash = None
+         result = None
+         error_category = None
++        cooldown = None
++        http_status = None
+         for event in record["events"]:
+             if event["kind"] == "response_saved":
+                 result_hash = event["result_sha256"]
+             elif event["kind"] == "failed":
+                 error_category = event["error_category"]
++                cooldown = _freeze(event.get("cooldown"))
++                http_status = event.get("http_status")
+         if state in {"response_received", "consumed"}:
+             result = _freeze(record["result"])
+         return DecisionRecord(
+@@ -782,6 +840,8 @@ class ProviderDecisionWAL:
+             result=result,
+             error_category=error_category,
+             event_count=len(record["events"]),
++            cooldown=cooldown,
++            http_status=http_status,
+         )
+ 
+     def reserve(self, identity: ProviderDecisionIdentity, request: dict) -> DecisionRecord:
+@@ -887,13 +947,17 @@ class ProviderDecisionWAL:
+             return self._view(record)
+ 
+     def record_error(self, identity: ProviderDecisionIdentity, request: dict,
+-                     category: str, phase: str) -> DecisionRecord:
++                     category: str, phase: str, *,
++                     cooldown: dict | None = None,
++                     http_status: int | None = None) -> DecisionRecord:
+         """Persist only a safe error category; never serialize exception text/body."""
+         if type(category) is not str or category not in _ERROR_CATEGORIES:
+             raise ValueError("Unsupported provider error category")
+         if (type(phase) is not str
+                 or phase not in {NOT_SENT, MAY_HAVE_BEEN_SENT, RESPONSE_RECEIVED}):
+             raise ValueError("Unsupported provider delivery phase")
++        safe_cooldown = _validate_cooldown(cooldown, category=category, phase=phase)
++        safe_status = _validate_http_status(http_status, phase=phase)
+         request_hash = _request_sha256(request)
+         with _writer_lock(self.path):
+             document = _read_document(self.path)
+@@ -901,7 +965,9 @@ class ProviderDecisionWAL:
+             view = self._view(record)
+             if view.state in {"failed", "ambiguous"}:
+                 latest = record["events"][-1]
+-                if latest["phase"] == phase and latest["error_category"] == category:
++                if (latest["phase"] == phase and latest["error_category"] == category
++                        and latest.get("cooldown") == safe_cooldown
++                        and latest.get("http_status") == safe_status):
+                     return view
+                 raise WALIdentityConflict("A different provider error is already durable")
+             if view.state == "reserved":
+@@ -918,6 +984,8 @@ class ProviderDecisionWAL:
+                 raise WALInvalidTransition("Provider error does not match the durable send phase")
+             self._append_event(
+                 document, record, "failed", phase, error_category=category,
++                **({"cooldown": safe_cooldown} if safe_cooldown is not None else {}),
++                **({"http_status": safe_status} if safe_status is not None else {}),
+             )
+             record["error_category"] = category
+             _seal_record(record)
+diff --git a/src/jev_factorio/provider_health.py b/src/jev_factorio/provider_health.py
+index ac880f77..0864197d 100644
+--- a/src/jev_factorio/provider_health.py
++++ b/src/jev_factorio/provider_health.py
+@@ -66,6 +66,7 @@ class ProviderCircuit:
+                       "last_recovery_at": None, "previous_incident": None,
+                       "budget_category": None, "budget_limit": None,
+                       "in_flight": None}
++        self._initial_state = deepcopy(self.state)
+         # Async callers share the same durable one-flight gate. The lock keeps
+         # concurrent tasks on this instance from reconciling one another's
+         # still-active reservation as a crash.
+@@ -85,6 +86,108 @@ class ProviderCircuit:
+     def __getattr__(self, name):
+         return getattr(self.client, name)
+ 
++    def prepare_decision_lease(self, wal, state, questions, *, identity):
++        """Prepare an explicit opt-in lease; ordinary provider calls stay unchanged."""
++        if self.path is None:
++            raise ValueError("Decision leases require a durable provider-health sidecar")
++        if Path(wal.path).resolve() == Path(self.path).resolve():
++            raise ValueError("Provider health and decision WAL must use separate files")
++        from .decision_lease import ProviderDecisionLease
++
++        with self._decision_health_writer_lock():
++            self._refresh_decision_health_state()
++            self._prepare_decision_authorization_locked(wal)
++            health_state_sha256 = self._decision_health_baseline_sha256_locked(
++                wal, identity,
++            )
++        return ProviderDecisionLease.prepare(
++            wal, self.client, state, questions, identity=identity, clock=self.clock,
++            health_state_sha256=health_state_sha256,
++        )
++
++    def _prepare_decision_authorization_locked(self, wal):
++        """Durably admit a pending operator probe before hashing a WAL baseline."""
++        if self.state.get("in_flight") is not None:
++            return
++        outcome = self.state.get("decision_outcome")
++        if outcome is not None:
++            wal_id = hashlib.sha256(
++                str(Path(wal.path).resolve()).encode("utf-8")).hexdigest()
++            if outcome["wal_id"] != wal_id:
++                raise SafetyStateError("Provider health sidecar is bound to another WAL")
++            if outcome["state"] != "failed":
++                # A response, ambiguous send, or consumed answer has its own
++                # immutable decision binding. Authorization cannot supersede it.
++                return
++        pending = self._authorization_preview()
++        if pending is None:
++            return
++        self._apply_authorization(pending, archive_terminal_decision=True)
++        self._refresh_decision_health_state()
++
++    def _decision_health_baseline_sha256(self, wal, identity):
++        """Bind a WAL request to the exact health baseline that authorized it."""
++        with self._decision_health_writer_lock():
++            self._refresh_decision_health_state()
++            return self._decision_health_baseline_sha256_locked(wal, identity)
++
++    def _decision_health_baseline_sha256_locked(self, wal, identity):
++        from .provider_decision_wal import canonical_sha256
++
++        wal_id = hashlib.sha256(
++            str(Path(wal.path).resolve()).encode("utf-8")).hexdigest()
++        identity_fields = ("session_id", "actor_id", "observation_id", "decision_id",
++                           "request_id")
++
++        def same_request(bound):
++            return (type(bound) is dict
++                    and all(bound.get(field) == getattr(identity, field, None)
++                            for field in identity_fields))
++
++        flight = self.state.get("in_flight")
++        if isinstance(flight, dict) and "decision_binding" in flight:
++            binding = flight["decision_binding"]
++            if binding["wal_id"] != wal_id:
++                raise SafetyStateError("Provider health sidecar is bound to another WAL")
++            bound_identity = binding["identity"]
++            if bound_identity.get("request_id") == identity.request_id:
++                if not same_request(bound_identity):
++                    raise SafetyStateError("Provider decision identity changed during recovery")
++                return binding["health_state_sha256"]
++
++        outcome = self.state.get("decision_outcome")
++        if isinstance(outcome, dict):
++            if outcome["wal_id"] != wal_id:
++                raise SafetyStateError("Provider health sidecar is bound to another WAL")
++            bound_identity = outcome["identity"]
++            if (outcome["state"] in {"response_received", "ambiguous"}
++                    and bound_identity["request_id"] != identity.request_id):
++                raise SafetyStateError(
++                    "An unresolved provider decision must be replayed or consumed first")
++            if bound_identity.get("request_id") == identity.request_id:
++                if not same_request(bound_identity):
++                    raise SafetyStateError("Provider decision identity changed after completion")
++                return outcome["health_state_sha256"]
++
++        return canonical_sha256(self.state)
++
++    def _decision_health_writer_lock(self):
++        from .provider_decision_wal import _writer_lock
++
++        if self.path is None:
++            raise SafetyStateError("Decision lease requires durable provider health")
++        return _writer_lock(self.path)
++
++    def _refresh_decision_health_state(self):
++        current = read_json(self.path)
++        if current is None:
++            if self.state != self._initial_state:
++                raise SafetyStateError("Provider health sidecar disappeared")
++            self.state = deepcopy(self._initial_state)
++            return
++        self._validate(current)
++        self.state = current
++
+     def _validate(self, value):
+         if (value.get("schema") != 1 or value.get("identity") != self.identity
+                 or value.get("phase") not in {"healthy", "cooldown", "exhausted"}
+@@ -98,6 +201,9 @@ class ProviderCircuit:
+                 or (value.get("budget_limit") is not None
+                     and (type(value["budget_limit"]) is not int or value["budget_limit"] < 1))):
+             raise SafetyStateError("Provider circuit identity or schema differs")
++        outcome = value.get("decision_outcome")
++        if outcome is not None:
++            self._validate_decision_outcome(outcome)
+         flight = value.get("in_flight")
+         if flight is not None and (
+                 not isinstance(flight, dict)
+@@ -108,6 +214,115 @@ class ProviderCircuit:
+                 or not math.isfinite(flight["started_at"])
+                 or type(flight.get("healthy_start")) is not bool):
+             raise SafetyStateError("Provider in-flight reservation is malformed")
++        if outcome is not None and flight is None:
++            from .provider_decision_wal import canonical_sha256
++            completed_state = deepcopy(value)
++            completed_state.pop("decision_outcome", None)
++            if canonical_sha256(completed_state) != outcome["health_result_sha256"]:
++                raise SafetyStateError("Provider decision completed health state changed")
++        if isinstance(flight, dict) and "decision_binding" in flight:
++            if set(flight) != {
++                    "request_id", "started_at", "healthy_start", "decision_binding",
++                    "decision_before", "authorization_sha256"}:
++                raise SafetyStateError("Provider decision flight fields are malformed")
++            self._validate_decision_binding(flight["decision_binding"])
++            before = flight["decision_before"]
++            if type(before) is not dict or before.get("in_flight") is not None:
++                raise SafetyStateError("Provider decision rollback snapshot is malformed")
++            self._validate(before)
++            from .provider_decision_wal import canonical_sha256
++            if canonical_sha256(before) != flight["decision_binding"]["health_state_sha256"]:
++                raise SafetyStateError("Provider decision pre-attempt health digest differs")
++            if (not isinstance(flight["authorization_sha256"], str)
++                    or len(flight["authorization_sha256"]) != 64
++                    or any(c not in "0123456789abcdef" for c in flight["authorization_sha256"])):
++                raise SafetyStateError("Provider decision authorization binding is malformed")
++            if flight["request_id"] != flight["decision_binding"]["identity"]["request_id"]:
++                raise SafetyStateError("Provider decision request crosslink differs")
++            if self._decision_reserved_state(before, flight) != value:
++                raise SafetyStateError("Provider decision rollback snapshot conflicts with its reservation")
++
++    @staticmethod
++    def _validate_decision_binding(value):
++        from .provider_decision_wal import ProviderDecisionIdentity
++
++        if type(value) is not dict or set(value) != {
++                "wal_id", "identity", "request_sha256", "health_state_sha256"}:
++            raise SafetyStateError("Provider decision WAL binding is malformed")
++        for name in ("wal_id", "request_sha256", "health_state_sha256"):
++            digest = value[name]
++            if (not isinstance(digest, str) or len(digest) != 64
++                    or any(c not in "0123456789abcdef" for c in digest)):
++                raise SafetyStateError("Provider decision WAL fingerprint is malformed")
++        if not isinstance(value["wal_id"], str):
++            raise SafetyStateError("Provider decision WAL fingerprint is malformed")
++        try:
++            ProviderDecisionIdentity(**value["identity"])
++        except (TypeError, ValueError) as error:
++            raise SafetyStateError("Provider decision identity is malformed") from error
++
++    @staticmethod
++    def _validate_decision_outcome(value):
++        from .provider_decision_wal import (
++            MAY_HAVE_BEEN_SENT, NOT_SENT, RESPONSE_RECEIVED,
++            ProviderDecisionIdentity,
++        )
++
++        fields = {"schema", "wal_id", "identity", "request_sha256",
++                  "health_state_sha256", "health_result_sha256", "state",
++                  "phase", "result_sha256", "error_category", "http_status"}
++        if type(value) is not dict or set(value) != fields or value.get("schema") != 1:
++            raise SafetyStateError("Provider decision outcome is malformed")
++        try:
++            ProviderDecisionIdentity(**value["identity"])
++        except (TypeError, ValueError) as error:
++            raise SafetyStateError("Provider decision outcome identity is malformed") from error
++        for name in ("wal_id", "request_sha256", "health_state_sha256",
++                     "health_result_sha256"):
++            digest = value[name]
++            if (not isinstance(digest, str) or len(digest) != 64
++                    or any(c not in "0123456789abcdef" for c in digest)):
++                raise SafetyStateError("Provider decision outcome digest is malformed")
++        if value["phase"] not in {NOT_SENT, MAY_HAVE_BEEN_SENT, RESPONSE_RECEIVED}:
++            raise SafetyStateError("Provider decision outcome phase is malformed")
++        if value["state"] == "response_received":
++            digest = value["result_sha256"]
++            if (value["phase"] != RESPONSE_RECEIVED or value["error_category"] is not None
++                    or value["http_status"] is not None
++                    or not isinstance(digest, str) or len(digest) != 64
++                    or any(c not in "0123456789abcdef" for c in digest)):
++                raise SafetyStateError("Provider decision response outcome is malformed")
++        elif value["state"] in {"failed", "ambiguous"}:
++            if (value["result_sha256"] is not None
++                    or not isinstance(value["error_category"], str)
++                    or value["error_category"] not in {
++                        "application_schema", "authentication_authorization", "account_quota",
++                        "rate_limit", "service_network", "unknown_outcome", "local_admission",
++                    }
++                    or (value["state"] == "ambiguous"
++                        and (value["phase"] != MAY_HAVE_BEEN_SENT
++                             or value["error_category"] == "local_admission"
++                             or value["http_status"] is not None))
++                    or (value["state"] == "failed"
++                        and (value["phase"] == MAY_HAVE_BEEN_SENT
++                             or (value["phase"] == NOT_SENT
++                                 and value["error_category"] != "local_admission")
++                             or (value["phase"] == RESPONSE_RECEIVED
++                                 and value["error_category"] == "local_admission"))
++                        )):
++                raise SafetyStateError("Provider decision error outcome is malformed")
++        elif value["state"] == "consumed":
++            digest = value["result_sha256"]
++            if (value["phase"] != RESPONSE_RECEIVED or value["error_category"] is not None
++                    or value["http_status"] is not None
++                    or not isinstance(digest, str) or len(digest) != 64
++                    or any(c not in "0123456789abcdef" for c in digest)):
++                raise SafetyStateError("Provider decision consumed outcome is malformed")
++        else:
++            raise SafetyStateError("Provider decision outcome state is unsupported")
++        status = value["http_status"]
++        if status is not None and (type(status) is not int or not 100 <= status <= 599):
++            raise SafetyStateError("Provider decision HTTP status is malformed")
+ 
+     def _save(self):
+         if self.path is not None:
+@@ -240,7 +455,7 @@ class ProviderCircuit:
+         return answers
+ 
+     async def evaluate_async(self, state: dict, questions: dict, *, identity,
+-                             deadline: float | None = None):
++                             deadline: float | None = None, decision_lease=None):
+         """Run one explicit async request through the existing durable circuit.
+ 
+         Async clients return immutable per-request results rather than the
+@@ -266,15 +481,399 @@ class ProviderCircuit:
+         if not isinstance(state, dict) or not isinstance(questions, dict):
+             raise TypeError("async provider state and questions must be JSON objects")
+         request = snapshot_json({"state": state, "questions": questions})
++        if decision_lease is not None:
++            decision_lease.assert_call(
++                self.client, request["state"], request["questions"], identity,
++            )
+         if self._async_lock is None:
+             self._async_lock = asyncio.Lock()
+         if self._async_lock.locked():
+             raise AsyncProviderQueueFull("provider health circuit is already evaluating", identity)
+         async with self._async_lock:
++            if decision_lease is not None:
++                with self._decision_health_writer_lock():
++                    self._refresh_decision_health_state()
++                    return await self._evaluate_async_with_lease_locked(
++                        request["state"], request["questions"], identity=identity,
++                        deadline=deadline, lease=decision_lease,
++                    )
+             return await self._evaluate_async_locked(
+                 request["state"], request["questions"], identity=identity,
+                 deadline=deadline)
+ 
++    def _decision_auth_digest(self) -> str:
++        authorization = None
++        if self.path is not None:
++            authorization = read_json(self.path.parent / "provider-authorization.json")
++        encoded = json.dumps(authorization, sort_keys=True, separators=(",", ":"),
++                             ensure_ascii=False, allow_nan=False).encode("utf-8")
++        return hashlib.sha256(encoded).hexdigest()
++
++    def _assert_durable_state(self, expected):
++        if self.path is None:
++            raise SafetyStateError("Decision lease requires durable provider health")
++        current = read_json(self.path)
++        if current is None:
++            if expected == self._initial_state:
++                return
++            raise SafetyStateError("Provider health sidecar disappeared")
++        self._validate(current)
++        if current != expected:
++            self.state = current
++            raise SafetyStateError("Provider health sidecar changed during decision lease")
++
++    def _save_decision_state(self, expected):
++        proposed = deepcopy(self.state)
++        self._assert_durable_state(expected)
++        try:
++            self._save()
++        except BaseException:
++            try:
++                current = read_json(self.path)
++                if current is not None:
++                    self._validate(current)
++                    self.state = current if current == proposed else expected
++                else:
++                    self.state = expected
++            except BaseException:
++                self.state = proposed
++            raise
++
++    def _outcome_for(self, lease, record):
++        from .provider_decision_wal import canonical_sha256
++
++        completed_state = deepcopy(self.state)
++        completed_state.pop("decision_outcome", None)
++        return {
++            "schema": 1,
++            "wal_id": lease.wal_id,
++            "identity": lease.identity.to_dict(),
++            "request_sha256": record.request_sha256,
++            "health_state_sha256": lease.health_state_sha256,
++            "health_result_sha256": canonical_sha256(completed_state),
++            "state": record.state,
++            "phase": record.phase,
++            "result_sha256": record.result_sha256,
++            "error_category": record.error_category,
++            "http_status": record.http_status,
++        }
++
++    def _outcome_matches(self, lease, record, outcome):
++        return outcome == self._outcome_for(lease, record)
++
++    @staticmethod
++    def _flight_matches(lease, flight):
++        return (isinstance(flight, dict)
++                and flight.get("decision_binding") == lease.binding())
++
++    def _decision_reserved_state(self, before, flight):
++        expected = deepcopy(before)
++        healthy_start = expected.get("phase") == "healthy"
++        if healthy_start != flight["healthy_start"]:
++            raise SafetyStateError("Provider decision health baseline changed")
++        if not healthy_start:
++            expected["attempts"] += 1
++            budget = expected.get("budget_category") or expected.get("category")
++            maximum = expected.get("budget_limit") or self._limit(budget)
++            expected["phase"] = "exhausted" if expected["attempts"] >= maximum else "cooldown"
++            expected["budget_category"] = budget
++            expected["budget_limit"] = maximum
++            expected["next_probe_at"] = flight["started_at"] + self._delay(
++                budget, expected["attempts"])
++        expected["in_flight"] = {
++            "request_id": flight["request_id"],
++            "started_at": flight["started_at"],
++            "healthy_start": healthy_start,
++            "decision_binding": deepcopy(flight["decision_binding"]),
++            "decision_before": deepcopy(before),
++            "authorization_sha256": flight["authorization_sha256"],
++        }
++        return expected
++
++    def _decision_blocked(self, identity, *, called=False, delivery_phase=None):
++        raise ProviderBlocked(self.state, called=called, identity=identity,
++                              delivery_phase=delivery_phase)
++
++    def _restore_decision_before(self, lease, flight):
++        expected = deepcopy(self.state)
++        before = deepcopy(flight["decision_before"])
++        if self._decision_reserved_state(before, flight) != expected:
++            raise SafetyStateError("Provider incident or budget changed before rollback")
++        if (self._decision_auth_digest() != flight["authorization_sha256"]
++                or expected.get("incident_id") != flight["decision_before"].get("incident_id")
++                or expected.get("authorization_id") != flight["decision_before"].get("authorization_id")):
++            raise SafetyStateError("Provider authorization or incident changed before rollback")
++        if not self._flight_matches(lease, expected.get("in_flight")):
++            raise SafetyStateError("Provider decision rollback crosslink changed")
++        self.state = before
++        self._save_decision_state(expected)
++
++    def _decision_failure_state(self, lease, record, flight):
++        """Finish one already-durable provider error exactly once."""
++        from .provider_decision_wal import MAY_HAVE_BEEN_SENT, NOT_SENT
++
++        if not self._flight_matches(lease, flight):
++            raise SafetyStateError("Provider decision error no longer owns the health reservation")
++        if self._decision_auth_digest() != flight["authorization_sha256"]:
++            raise SafetyStateError("Provider authorization changed during a decision")
++        if record.phase == NOT_SENT and record.error_category == "local_admission":
++            self._restore_decision_before(lease, flight)
++            return
++        if record.error_category == "unknown_outcome" and record.phase == MAY_HAVE_BEEN_SENT:
++            now = self.clock()
++            reservation = deepcopy(self.state)
++            if flight["healthy_start"]:
++                self.state.update(incident_id=str(uuid4()),
++                                  first_failure_at=flight["started_at"], attempts=1,
++                                  category="unknown_outcome", budget_category="unknown_outcome",
++                                  budget_limit=1, phase="exhausted",
++                                  next_probe_at=now + self._delay("unknown_outcome", 1))
++            else:
++                budget = self.state.get("budget_category") or self.state.get("category")
++                limit = self.state.get("budget_limit") or self._limit(budget)
++                self.state.update(category="unknown_outcome", budget_category=budget,
++                                  budget_limit=limit,
++                                  phase="exhausted" if self.state["attempts"] >= limit else "cooldown")
++            self.state["in_flight"] = None
++            self.state["decision_outcome"] = self._outcome_for(lease, record)
++            self._save_decision_state(reservation)
++            return
++
++        kind = record.error_category
++        if kind is None:
++            raise SafetyStateError("Provider decision failure lacks a category")
++        now = self.clock()
++        reservation = deepcopy(self.state)
++        if flight["healthy_start"]:
++            attempts = 1
++            budget_limit = self._limit(kind)
++            budget_category = kind
++            self.state.update(incident_id=str(uuid4()), first_failure_at=now,
++                              attempts=attempts, budget_category=budget_category,
++                              budget_limit=budget_limit)
++        else:
++            attempts = self.state["attempts"]
++            budget_category = self.state.get("budget_category") or kind
++            budget_limit = min(self.state.get("budget_limit") or self._limit(budget_category),
++                               self._limit(kind))
++            self.state.update(budget_category=budget_category, budget_limit=budget_limit)
++        delay = self._delay(budget_category, attempts)
++        cooldown = record.cooldown
++        if cooldown is not None:
++            cooldown_end = cooldown["received_at"] + cooldown["retry_after_seconds"]
++            delay = max(delay, max(0.0, cooldown_end - now))
++        next_probe = now + delay
++        if cooldown is not None:
++            next_probe = max(now + self._delay(budget_category, attempts),
++                             cooldown["received_at"] + cooldown["retry_after_seconds"])
++        self.state.update(category=kind,
++                          phase="exhausted" if attempts >= budget_limit else "cooldown",
++                          next_probe_at=next_probe, in_flight=None)
++        self.state["decision_outcome"] = self._outcome_for(lease, record)
++        self._save_decision_state(reservation)
++
++    def _finish_decision_success(self, lease, record, flight, identity):
++        if not self._flight_matches(lease, flight):
++            raise SafetyStateError("Provider decision result no longer owns the health reservation")
++        if self._decision_auth_digest() != flight["authorization_sha256"]:
++            raise SafetyStateError("Provider authorization changed during a decision")
++        now = self.clock()
++        reservation = deepcopy(self.state)
++        if not flight["healthy_start"]:
++            self.state.update(previous_incident={key: self.state[key] for key in
++                              ("incident_id", "category", "attempts", "first_failure_at")},
++                              phase="healthy", category=None, attempts=0, next_probe_at=0,
++                              last_recovery_at=now, incident_id=None, first_failure_at=None,
++                              budget_category=None, budget_limit=None, in_flight=None)
++        else:
++            self.state["in_flight"] = None
++        self.state["decision_outcome"] = self._outcome_for(lease, record)
++        self._save_decision_state(reservation)
++        return lease.recover_result(record)
++
++    async def _evaluate_async_with_lease_locked(self, state, questions, *, identity,
++                                                 deadline, lease):
++        from .async_provider import (
++            AsyncProviderLocalError,
++            AsyncProviderPayloadError,
++            AsyncProviderResult,
++            NOT_SENT,
++        )
++        from .provider_decision_wal import (
++            MAY_HAVE_BEEN_SENT, RESPONSE_RECEIVED,
++            WALInvalidTransition, WALResponseConsumed,
++        )
++        from .judgments import InvalidJudgment, validate_answers
++
++        now = self.clock()
++        record = lease.inspect_optional()
++        flight = self.state.get("in_flight")
++        if flight is not None and "decision_binding" in flight:
++            if not self._flight_matches(lease, flight):
++                raise SafetyStateError("A different provider decision owns the health reservation")
++            self._assert_durable_state(self.state)
++            if self._decision_auth_digest() != flight["authorization_sha256"]:
++                raise SafetyStateError("Provider authorization changed during a decision")
++            if record is None or record.request_sha256 != lease.binding()["request_sha256"]:
++                raise SafetyStateError("Provider health reservation has no matching WAL record")
++            if record.state == "response_received":
++                return self._finish_decision_success(lease, record, flight, identity)
++            if record.state in {"failed", "ambiguous"}:
++                self._decision_failure_state(lease, record, flight)
++                if record.phase == NOT_SENT:
++                    raise AsyncProviderLocalError(
++                        "The exact decision was durably closed before provider dispatch", identity)
++                self._decision_blocked(identity, called=True, delivery_phase=record.phase)
++            if record.state == "consumed":
++                raise WALResponseConsumed("Provider decision was already consumed")
++            if record.state == "may_have_been_sent":
++                record = lease.wal.record_error(
++                    lease.identity, lease.wal_request, "unknown_outcome", MAY_HAVE_BEEN_SENT,
++                )
++                self._decision_failure_state(lease, record, flight)
++                self._decision_blocked(identity, called=True,
++                                       delivery_phase=MAY_HAVE_BEEN_SENT)
++            if record.state != "reserved":
++                raise WALInvalidTransition("Provider decision is not safe to dispatch")
++            reservation = deepcopy(self.state)
++        elif flight is not None:
++            if record is not None and record.state in {
++                    "reserved", "may_have_been_sent", "response_received", "ambiguous"}:
++                raise SafetyStateError("Provider WAL obligation conflicts with legacy health flight")
++            if self._reconcile_in_flight(now):
++                self._decision_blocked(identity, delivery_phase=NOT_SENT)
++            self._decision_blocked(identity, delivery_phase=NOT_SENT)
++        else:
++            outcome = self.state.get("decision_outcome")
++            if outcome is not None and outcome["wal_id"] != lease.wal_id:
++                raise SafetyStateError("Provider health sidecar is bound to another WAL")
++            same_completed_request = (
++                outcome is not None
++                and outcome["identity"]["request_id"] == lease.identity.request_id
++            )
++            if same_completed_request and record is None:
++                raise SafetyStateError("Provider health outcome has no matching WAL record")
++            if not same_completed_request:
++                from .provider_decision_wal import canonical_sha256
++                if canonical_sha256(self.state) != lease.health_state_sha256:
++                    raise SafetyStateError("Provider health changed after lease preparation")
++            if record is not None:
++                if record.state in {"response_received", "consumed"}:
++                    if not self._outcome_matches(lease, record, outcome):
++                        raise SafetyStateError("Saved provider answer has no matching health outcome")
++                    if record.state == "consumed":
++                        raise WALResponseConsumed("Provider decision was already consumed")
++                    return lease.recover_result(record)
++                if record.state in {"failed", "ambiguous"}:
++                    if (record.phase == NOT_SENT and record.error_category == "local_admission"
++                            and outcome is None):
++                        raise AsyncProviderLocalError(
++                            "The exact decision was durably closed before provider dispatch", identity)
++                    if not self._outcome_matches(lease, record, outcome):
++                        raise SafetyStateError("Provider failure has no matching health outcome")
++                    self._decision_blocked(identity, called=record.phase != NOT_SENT,
++                                           delivery_phase=record.phase)
++                if record.state == "may_have_been_sent":
++                    raise SafetyStateError("Ambiguous WAL request has no health reservation")
++                if record.state != "reserved":
++                    raise WALInvalidTransition("Provider decision is not safe to dispatch")
++
++            pending_auth = self._authorization_preview()
++            if pending_auth is not None:
++                raise SafetyStateError(
++                    "Provider authorization changed after decision lease preparation")
++            if self.state["phase"] == "exhausted" or now < self.state["next_probe_at"]:
++                self._decision_blocked(identity, delivery_phase=NOT_SENT)
++
++            record = lease.reserve()
++            if record.state != "reserved":
++                raise WALInvalidTransition("An existing request cannot authorize a new send")
++            before_attempt = deepcopy(self.state)
++            healthy_start = self.state["phase"] == "healthy"
++            if not healthy_start:
++                self.state["attempts"] += 1
++                budget = self.state.get("budget_category") or self.state.get("category")
++                maximum = self.state.get("budget_limit") or self._limit(budget)
++                self.state["phase"] = "exhausted" if self.state["attempts"] >= maximum else "cooldown"
++                self.state["budget_category"] = budget
++                self.state["budget_limit"] = maximum
++                self.state["next_probe_at"] = now + self._delay(budget, self.state["attempts"])
++            self.state["in_flight"] = {
++                "request_id": identity.request_id,
++                "started_at": now,
++                "healthy_start": healthy_start,
++                "decision_binding": lease.binding(),
++                "decision_before": before_attempt,
++                "authorization_sha256": self._decision_auth_digest(),
++            }
++            reservation = deepcopy(self.state)
++            self._save_decision_state(before_attempt)
++
++        flight = self.state["in_flight"]
++        try:
++            result = await self.client.evaluate(
++                state, questions, identity=identity, deadline=deadline,
++                decision_lease=lease,
++            )
++            if (not isinstance(result, AsyncProviderResult)
++                    or result.identity != identity
++                    or result.requested_model != lease.model_id
++                    or result.request_payload_sha256 != lease.request_payload_sha256):
++                raise AsyncProviderPayloadError(identity, "Provider result binding rejected")
++
++            from collections.abc import Mapping
++
++            def mutable(value):
++                if isinstance(value, Mapping):
++                    return {key: mutable(item) for key, item in value.items()}
++                if isinstance(value, (list, tuple)):
++                    return [mutable(item) for item in value]
++                return value
++
++            try:
++                validate_answers(questions, mutable(result.answers),
++                                 quantum=getattr(self.client, "answer_quantum", 0))
++            except InvalidJudgment as error:
++                raise AsyncProviderPayloadError(identity, "Provider answer schema rejected") from error
++            record = lease.inspect()
++            if record.state != "response_received":
++                raise SafetyStateError("Provider returned without a durable WAL response")
++        except BaseException as error:
++            record = lease.inspect_optional()
++            current_flight = self.state.get("in_flight")
++            if (record is not None and record.state == "failed"
++                    and record.phase == NOT_SENT and record.error_category == "local_admission"):
++                self._restore_decision_before(lease, current_flight)
++                raise
++            if (record is not None and record.state == "failed"
++                    and record.phase == RESPONSE_RECEIVED
++                    and record.error_category is not None):
++                self._decision_failure_state(lease, record, current_flight)
++                raise ProviderBlocked(
++                    self.state, called=True, identity=identity,
++                    delivery_phase=RESPONSE_RECEIVED,
++                ) from None
++            kind = (category(error)
++                    if isinstance(error, (requests.RequestException, ProviderPayloadError))
++                    else None)
++            if kind is not None and current_flight is not None:
++                if record is not None and record.state == "ambiguous":
++                    if kind == "unknown_outcome":
++                        raise
++                    self._decision_failure_state(lease, record, current_flight)
++                    raise ProviderBlocked(
++                        self.state, called=True, identity=identity,
++                        delivery_phase=getattr(error, "delivery_phase", MAY_HAVE_BEEN_SENT),
++                    ) from None
++            raise
++
++        record = lease.inspect()
++        if record.state != "response_received":
++            raise SafetyStateError("Decision WAL response disappeared before health commit")
++        return self._finish_decision_success(
++            lease, record, self.state["in_flight"], identity,
++        )
++
+     async def _evaluate_async_locked(self, state: dict, questions: dict, *, identity,
+                                      deadline: float | None):
+         from .async_provider import (
+@@ -419,11 +1018,16 @@ class ProviderCircuit:
+         return result
+ 
+     def _authorization(self):
++        pending = self._authorization_preview()
++        if pending is not None:
++            self._apply_authorization(pending)
++
++    def _authorization_preview(self):
+         if self.path is None or self.state["phase"] == "healthy":
+-            return
++            return None
+         request = read_json(self.path.parent / "provider-authorization.json")
+         if request is None or request.get("request_id") == self.state.get("authorization_id"):
+-            return
++            return None
+         request_id, evidence = request.get("request_id"), request.get("evidence_sha256")
+         if (request.get("incident_id") != self.state["incident_id"]
+                 or not isinstance(request_id, str) or len(request_id) != 36
+@@ -431,17 +1035,36 @@ class ProviderCircuit:
+                 or not isinstance(evidence, str) or len(evidence) != 64
+                 or any(c not in "0123456789abcdef" for c in evidence)):
+             raise SafetyStateError("Provider probe authorization does not match this incident")
+-        # Immutable history first, then an atomic new generation of probe budget.
+         history_path = self.path.parent / ("provider-authorized-" + request_id + ".json")
+         history = {"request": request, "previous_state": self.state}
+         existing = read_json(history_path)
+         if existing is not None and existing != history:
+             raise SafetyStateError("Provider authorization history conflict")
++        return {"request": request, "history_path": history_path,
++                "history": history, "existing": existing}
++
++    def _apply_authorization(self, pending, *, archive_terminal_decision=False):
++        request = read_json(self.path.parent / "provider-authorization.json")
++        if request != pending["request"]:
++            raise SafetyStateError("Provider authorization changed during request admission")
++        history_path = pending["history_path"]
++        history = pending["history"]
++        existing = read_json(history_path)
++        if existing is not None and existing != history:
++            raise SafetyStateError("Provider authorization history conflict")
++        # Immutable history first, then an atomic new generation of probe budget.
+         if existing is None:
+             atomic_json(history_path, history)
+         self.state = {**self.state, "phase": "cooldown", "attempts": 0,
+-                      "next_probe_at": 0, "authorization_id": request_id,
++                      "next_probe_at": 0,
++                      "authorization_id": pending["request"]["request_id"],
+                       "budget_category": None, "budget_limit": None, "in_flight": None}
++        if (archive_terminal_decision
++                and isinstance(self.state.get("decision_outcome"), dict)
++                and self.state["decision_outcome"].get("state") == "failed"):
++            # The immutable authorization history above retains the complete
++            # terminal prior state; it is no longer the active WAL crosslink.
++            self.state.pop("decision_outcome")
+         self._save()
+ 
+     @staticmethod
+diff --git a/tests/test_async_provider_wal.py b/tests/test_async_provider_wal.py
+new file mode 100644
+index 00000000..3bae9b51
+--- /dev/null
++++ b/tests/test_async_provider_wal.py
+@@ -0,0 +1,1678 @@
++"""Public async client/provider health binding tests for the decision WAL."""
++from __future__ import annotations
++
++import asyncio
++from copy import deepcopy
++import json
++from pathlib import Path
++import subprocess
++import sys
++import time
++from uuid import uuid4
++
++import httpx
++import pytest
++
++from jev_factorio import provider_decision_wal as wal_module
++from jev_factorio.async_provider import (
++    AsyncProviderCancelled,
++    AsyncProviderDeadlineExceeded,
++    AsyncProviderLocalError,
++    RequestIdentity,
++)
++from jev_factorio.jev_client import (
++    AsyncCloudflareJevClient,
++    AsyncJevClient,
++    AsyncMockJevClient,
++    AsyncTracedClient,
++)
++from jev_factorio.causal_trace import CausalTrace
++from jev_factorio.provider_decision_wal import ProviderDecisionWAL
++from jev_factorio.provider_decision_wal import WALBusyError
++from jev_factorio.provider_health import ProviderBlocked, ProviderCircuit, SafetyStateError
++
++
++STATE = {"tick": 42, "inventory": {"coal": 3}}
++QUESTIONS = {"ready": {"type": "choice", "criteria": {"yes": "ready"}}}
++
++
++def _answers():
++    return {"ready": {"type": "choice", "choice": "yes",
++                      "probabilities": {"yes": 1.0}, "confidence": 1.0}}
++
++
++class Clock:
++    def __init__(self, now=1000.0):
++        self.now = now
++
++    def __call__(self):
++        return self.now
++
++
++class Sink:
++    def __init__(self):
++        self.events = []
++
++    def emit(self, kind, payload):
++        self.events.append((kind, payload))
++
++
++def _identity(label: str) -> RequestIdentity:
++    return RequestIdentity(
++        session_id=f"session-{label}", actor_id=f"actor-{label}",
++        observation_id=f"observation-{label}", decision_id=f"decision-{label}",
++        request_id=str(uuid4()),
++    )
++
++
++def test_public_mock_decision_lease_saves_before_health_clear(tmp_path):
++    async def exercise():
++        client = AsyncMockJevClient()
++        circuit = ProviderCircuit(client, tmp_path / "health.json")
++        wal = ProviderDecisionWAL.initialize(tmp_path / "decision.json")
++        identity = _identity("mock")
++        lease = circuit.prepare_decision_lease(wal, STATE, QUESTIONS, identity=identity)
++
++        result = await circuit.evaluate_async(
++            STATE, QUESTIONS, identity=identity, decision_lease=lease,
++        )
++
++        record = lease.inspect()
++        assert result.identity is identity
++        assert record.state == "response_received"
++        assert record.identity.request_id == identity.request_id
++        assert circuit.state["in_flight"] is None
++        assert circuit.state["decision_outcome"]["result_sha256"] == record.result_sha256
++        assert circuit.state["decision_outcome"]["identity"]["decision_id"] == identity.decision_id
++
++    asyncio.run(exercise())
++
++
++@pytest.mark.parametrize("provider", ["typesafe", "cloudflare"])
++def test_direct_and_cloudflare_leases_bind_fake_transport_and_replay(tmp_path, provider):
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        if provider == "typesafe":
++            body = {"answers": _answers(), "usage": {"input_tokens": 1},
++                    "model": "resolved-typesafe"}
++        else:
++            body = {"success": True, "result": {
++                "answers": _answers(), "usage": {"input_tokens": 2},
++                "model": "resolved-cloudflare"}}
++        return httpx.Response(200, json=body, request=request)
++
++    async def exercise():
++        if provider == "typesafe":
++            client = AsyncJevClient(
++                api_key="offline-typesafe-secret", base_url="https://offline.invalid/type",
++                model="model-typesafe", transport=httpx.MockTransport(handler),
++            )
++        else:
++            client = AsyncCloudflareJevClient(
++                "offline-account", "offline-cloudflare-secret", model="model-cloudflare",
++                transport=httpx.MockTransport(handler),
++            )
++        health_path = tmp_path / f"health-{provider}.json"
++        circuit = ProviderCircuit(client, health_path)
++        wal = ProviderDecisionWAL.initialize(tmp_path / f"wal-{provider}.json")
++        request_identity = _identity(provider)
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            result = await circuit.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++            replay = await circuit.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++        finally:
++            await client.aclose()
++        assert result == replay
++        assert result.identity is request_identity
++        assert result.request_payload_sha256 == lease.request_payload_sha256
++        assert result.requested_model == client.model
++        assert len(calls) == 1
++        assert lease.inspect().state == "response_received"
++        assert circuit.state["decision_outcome"]["result_sha256"] == lease.inspect().result_sha256
++        for path in (health_path, wal.path):
++            text = path.read_text(encoding="utf-8")
++            assert "offline-typesafe-secret" not in text
++            assert "offline-cloudflare-secret" not in text
++            assert "Authorization" not in text
++
++    asyncio.run(exercise())
++
++
++def test_lease_rejects_changed_model_before_wal_or_health_mutation(tmp_path):
++    client = AsyncMockJevClient()
++    health_path = tmp_path / "health.json"
++    circuit = ProviderCircuit(client, health_path)
++    wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++    request_identity = _identity("model-drift")
++    lease = circuit.prepare_decision_lease(
++        wal, STATE, QUESTIONS, identity=request_identity)
++    before = dict(circuit.state)
++    client.model = "unreviewed-model"
++
++    with pytest.raises(ValueError, match="configuration or request changed"):
++        asyncio.run(circuit.evaluate_async(
++            STATE, QUESTIONS, identity=request_identity, decision_lease=lease))
++
++    assert circuit.state == before
++    assert not health_path.exists()
++    assert lease.inspect_optional() is None
++
++
++def test_trace_model_call_identity_is_part_of_the_wal_binding(tmp_path):
++    async def exercise():
++        sink = Sink()
++        trace = CausalTrace(sink, "lease-trace")
++        request_identity = _identity("traced")
++        trace.begin_step()
++        trace.decision_id = request_identity.decision_id
++        trace.observation_id = request_identity.observation_id
++        trace._session_id = request_identity.session_id
++        client = AsyncTracedClient(AsyncMockJevClient(), trace)
++        circuit = ProviderCircuit(client, tmp_path / "health.json")
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        result = await circuit.evaluate_async(
++            STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++        request_event = next(payload for kind, payload in sink.events
++                             if kind == "model_request")
++        response_event = next(payload for kind, payload in sink.events
++                              if kind == "model_response")
++        assert result.identity is request_identity
++        assert lease.trace_binding["model_call_id"] == "model-request:" + request_identity.request_id
++        assert request_event["model_call_id"] == lease.trace_binding["model_call_id"]
++        assert response_event["model_call_id"] == lease.trace_binding["model_call_id"]
++        assert lease.inspect().request_sha256 == lease.request_sha256
++        assert circuit.state["in_flight"] is None
++
++    asyncio.run(exercise())
++
++
++def test_deadline_before_transport_durably_closes_not_sent_and_restores_health(tmp_path):
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        health_path = tmp_path / "health.json"
++        circuit = ProviderCircuit(client, health_path)
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        request_identity = _identity("expired")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        before = dict(circuit.state)
++        try:
++            with pytest.raises(AsyncProviderDeadlineExceeded) as raised:
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity,
++                    decision_lease=lease, deadline=time.monotonic() - 1,
++                )
++            assert lease.inspect().state == "failed"
++            assert lease.inspect().phase == "not_sent"
++            assert lease.inspect().error_category == "local_admission"
++            assert circuit.state == before
++            assert json.loads(health_path.read_text())["in_flight"] is None
++            assert calls == []
++            with pytest.raises(AsyncProviderLocalError):
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease,
++                )
++            assert calls == []
++        finally:
++            await client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_dispatch_fsync_failure_never_enters_http_and_reserved_retry_is_safe(tmp_path, monkeypatch):
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, tmp_path / "health.json")
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        request_identity = _identity("may-fsync")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        atomic = wal_module.atomic_json
++
++        def fail_may_before_replace(path, value):
++            if path == wal.path and value.get("last_sequence") == 2:
++                raise OSError("injected MAY fsync boundary failure")
++            return atomic(path, value)
++
++        monkeypatch.setattr(wal_module, "atomic_json", fail_may_before_replace)
++        try:
++            with pytest.raises(OSError, match="MAY fsync"):
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++            assert calls == []
++            assert lease.inspect().state == "reserved"
++            assert circuit.state["in_flight"]["decision_binding"] == lease.binding()
++            monkeypatch.setattr(wal_module, "atomic_json", atomic)
++            result = await circuit.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++            assert result.answers["ready"]["choice"] == "yes"
++            assert len(calls) == 1
++            assert lease.inspect().state == "response_received"
++        finally:
++            await client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_saved_response_survives_final_health_write_failure_and_restart(tmp_path, monkeypatch):
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        health_path = tmp_path / "health.json"
++        circuit = ProviderCircuit(client, health_path)
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        request_identity = _identity("health-write")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        real_save = circuit._save
++
++        def fail_only_after_response():
++            if circuit.state["in_flight"] is None:
++                raise OSError("injected health outcome persistence failure")
++            real_save()
++
++        monkeypatch.setattr(circuit, "_save", fail_only_after_response)
++        try:
++            with pytest.raises(OSError, match="health outcome"):
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++            assert len(calls) == 1
++            assert lease.inspect().state == "response_received"
++            assert json.loads(health_path.read_text())["in_flight"] is not None
++        finally:
++            await client.aclose()
++
++        recovered_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(handler))
++        recovered = ProviderCircuit(recovered_client, health_path)
++        recovered_lease = recovered.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            result = await recovered.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity,
++                decision_lease=recovered_lease)
++        finally:
++            await recovered_client.aclose()
++        assert result.identity is request_identity
++        assert result.answers["ready"]["choice"] == "yes"
++        assert len(calls) == 1
++        assert recovered.state["in_flight"] is None
++        assert recovered.state["decision_outcome"]["result_sha256"] == lease.inspect().result_sha256
++
++    asyncio.run(exercise())
++
++
++def test_response_is_durable_before_release_cancellation_then_replays(tmp_path):
++    calls = []
++
++    async def exercise():
++        entered, answer, release_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
++
++        async def handler(request):
++            calls.append(request)
++            entered.set()
++            await answer.wait()
++            return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        health_path = tmp_path / "health.json"
++        circuit = ProviderCircuit(client, health_path)
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        request_identity = _identity("release-cancel")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        original_release = client._release
++
++        async def observe_release():
++            release_started.set()
++            return await original_release()
++
++        client._release = observe_release
++        task = asyncio.create_task(circuit.evaluate_async(
++            STATE, QUESTIONS, identity=request_identity, decision_lease=lease))
++        await entered.wait()
++        await client._condition.acquire()
++        try:
++            answer.set()
++            await asyncio.wait_for(release_started.wait(), timeout=2)
++            assert lease.inspect().state == "response_received"
++            task.cancel()
++            await asyncio.sleep(0)
++            task.cancel()
++            await asyncio.sleep(0)
++            assert not task.done()
++        finally:
++            client._condition.release()
++        with pytest.raises(AsyncProviderCancelled) as cancelled:
++            await task
++        assert cancelled.value.delivery_phase == "response_received"
++        assert len(calls) == 1
++        assert circuit.state["in_flight"] is not None
++        await client.aclose()
++
++        recovered_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(handler))
++        recovered = ProviderCircuit(recovered_client, health_path)
++        recovered_lease = recovered.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            result = await recovered.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity,
++                decision_lease=recovered_lease)
++        finally:
++            await recovered_client.aclose()
++        assert result.answers["ready"]["choice"] == "yes"
++        assert len(calls) == 1
++        assert recovered.state["in_flight"] is None
++
++    asyncio.run(exercise())
++
++
++def test_retry_after_metadata_recovers_without_extending_or_losing_source_clock(tmp_path, monkeypatch):
++    calls = []
++    clock = Clock()
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(429, headers={"Retry-After": "12"},
++                              json={"secret": "do-not-persist"}, request=request)
++
++    async def exercise():
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        health_path = tmp_path / "health.json"
++        circuit = ProviderCircuit(client, health_path, clock=clock)
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        request_identity = _identity("retry-after")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        real_save = circuit._save
++
++        def fail_only_after_provider_error():
++            if circuit.state["in_flight"] is None:
++                raise OSError("injected post-error health write failure")
++            real_save()
++
++        monkeypatch.setattr(circuit, "_save", fail_only_after_provider_error)
++        try:
++            with pytest.raises(OSError, match="post-error"):
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++            record = lease.inspect()
++            assert record.state == "failed"
++            assert record.phase == "response_received"
++            assert record.error_category == "rate_limit"
++            assert record.http_status == 429
++            assert dict(record.cooldown) == {
++                "received_at": 1000.0, "retry_after_seconds": 12.0}
++            ledger_text = wal.path.read_text()
++            assert "Retry-After" not in ledger_text
++            assert "do-not-persist" not in ledger_text
++            assert len(calls) == 1
++        finally:
++            await client.aclose()
++
++        clock.now = 1005.0
++        recovered_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(handler))
++        recovered = ProviderCircuit(recovered_client, health_path, clock=clock)
++        recovered_lease = recovered.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            with pytest.raises(ProviderBlocked) as blocked:
++                await recovered.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity,
++                    decision_lease=recovered_lease)
++            assert blocked.value.state["category"] == "rate_limit"
++            assert blocked.value.state["next_probe_at"] == 1012.0
++            assert blocked.value.delivery_phase == "response_received"
++            assert len(calls) == 1
++        finally:
++            await recovered_client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_cleanup_cancellation_keeps_durable_response_for_exact_replay(tmp_path):
++    calls = []
++
++    async def exercise():
++        entered, response_gate, release_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
++
++        async def handler(request):
++            calls.append(request)
++            entered.set()
++            await response_gate.wait()
++            return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        request_identity = _identity("cleanup-cancel")
++        circuit = ProviderCircuit(client, health_path)
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        original_release = client._release
++
++        async def observe_release():
++            release_started.set()
++            return await original_release()
++
++        client._release = observe_release
++        task = asyncio.create_task(circuit.evaluate_async(
++            STATE, QUESTIONS, identity=request_identity, decision_lease=lease))
++        await entered.wait()
++        await client._condition.acquire()
++        try:
++            response_gate.set()
++            await asyncio.wait_for(release_started.wait(), timeout=2)
++            assert lease.inspect().state == "response_received"
++            task.cancel()
++            await asyncio.sleep(0)
++            task.cancel()
++            await asyncio.sleep(0)
++            assert not task.done()
++        finally:
++            client._condition.release()
++        with pytest.raises(AsyncProviderCancelled) as cancelled:
++            await task
++        assert cancelled.value.delivery_phase == "response_received"
++        assert circuit.state["in_flight"] is not None
++        assert len(calls) == 1
++        await client.aclose()
++
++        restarted_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(handler))
++        restarted = ProviderCircuit(restarted_client, health_path)
++        restarted_lease = restarted.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            result = await restarted.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity,
++                decision_lease=restarted_lease)
++        finally:
++            await restarted_client.aclose()
++        assert result.identity is request_identity
++        assert result.answers["ready"]["choice"] == "yes"
++        assert len(calls) == 1
++        assert restarted.state["in_flight"] is None
++
++    asyncio.run(exercise())
++
++
++def test_ambiguous_timeout_is_billed_once_and_never_reenters_transport(tmp_path):
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        raise httpx.ReadTimeout("offline ambiguous transport", request=request)
++
++    async def exercise():
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, tmp_path / "health.json", clock=Clock())
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        request_identity = _identity("ambiguous-timeout")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            with pytest.raises(ProviderBlocked) as blocked:
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++            assert blocked.value.state["category"] == "service_network"
++            assert blocked.value.delivery_phase == "may_have_been_sent"
++            record = lease.inspect()
++            assert record.state == "ambiguous"
++            assert record.error_category == "service_network"
++            with pytest.raises(ProviderBlocked) as replay:
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++            assert replay.value.delivery_phase == "may_have_been_sent"
++            assert replay.value.state["incident_id"] == blocked.value.state["incident_id"]
++            assert len(calls) == 1
++            assert circuit.state["in_flight"] is None
++            with pytest.raises(SafetyStateError, match="must be replayed or consumed"):
++                circuit.prepare_decision_lease(
++                    wal, STATE, QUESTIONS, identity=_identity("after-ambiguous"))
++        finally:
++            await client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_invalid_answer_is_closed_in_wal_as_schema_failure(tmp_path):
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={
++            "answers": {"ready": {"type": "not-a-choice", "secret": "do-not-save"}},
++        }, request=request)
++
++    async def exercise():
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, tmp_path / "health.json", clock=Clock())
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        request_identity = _identity("invalid-answer")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            with pytest.raises(ProviderBlocked) as blocked:
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++            assert blocked.value.state["category"] == "application_schema"
++            record = lease.inspect()
++            assert record.state == "failed"
++            assert record.phase == "response_received"
++            assert record.error_category == "application_schema"
++            assert record.result is None
++            assert "do-not-save" not in wal.path.read_text()
++            assert len(calls) == 1
++        finally:
++            await client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_external_authorization_change_blocks_health_result_commit(tmp_path):
++    from jev_factorio.operational_safety import atomic_json
++    from jev_factorio.provider_health import SafetyStateError
++
++    calls = []
++
++    async def exercise():
++        entered, return_response = asyncio.Event(), asyncio.Event()
++
++        async def handler(request):
++            calls.append(request)
++            entered.set()
++            await return_response.wait()
++            return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        health_path = tmp_path / "health.json"
++        circuit = ProviderCircuit(client, health_path)
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        request_identity = _identity("auth-change")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        task = asyncio.create_task(circuit.evaluate_async(
++            STATE, QUESTIONS, identity=request_identity, decision_lease=lease))
++        try:
++            await entered.wait()
++            auth_path = tmp_path / "provider-authorization.json"
++            replacement = {"operator_event": "independent durable update"}
++            atomic_json(auth_path, replacement)
++            before = auth_path.read_bytes()
++            return_response.set()
++            with pytest.raises(SafetyStateError, match="authorization changed"):
++                await task
++            assert auth_path.read_bytes() == before
++            assert json.loads(health_path.read_text())["in_flight"] is not None
++            assert lease.inspect().state == "response_received"
++            assert len(calls) == 1
++        finally:
++            return_response.set()
++            await client.aclose()
++
++        blocked_health_bytes = health_path.read_bytes()
++        restarted_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(handler))
++        restarted = ProviderCircuit(restarted_client, health_path)
++        restarted_lease = restarted.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            with pytest.raises(SafetyStateError, match="authorization changed"):
++                await restarted.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity,
++                    decision_lease=restarted_lease)
++            assert health_path.read_bytes() == blocked_health_bytes
++            assert len(calls) == 1
++        finally:
++            await restarted_client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_restart_after_may_sent_uses_exact_wal_binding_and_charges_unknown_once(tmp_path):
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        first_client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        first = ProviderCircuit(first_client, health_path, clock=Clock())
++        request_identity = _identity("crash-after-may")
++        lease = first.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++
++        # This is the durable crash checkpoint: health owns the exact flight,
++        # while WAL says dispatch may have begun and has no response evidence.
++        before = deepcopy(first.state)
++        lease.reserve()
++        started_at = first.clock()
++        first.state["in_flight"] = {
++            "request_id": request_identity.request_id,
++            "started_at": started_at,
++            "healthy_start": True,
++            "decision_binding": lease.binding(),
++            "decision_before": before,
++            "authorization_sha256": first._decision_auth_digest(),
++        }
++        first._save_decision_state(before)
++        lease.mark_may_have_been_sent()
++        assert lease.inspect().state == "may_have_been_sent"
++        await first_client.aclose()
++
++        restarted_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(handler))
++        restarted = ProviderCircuit(restarted_client, health_path, clock=Clock())
++        resumed = restarted.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            with pytest.raises(ProviderBlocked) as blocked:
++                await restarted.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=resumed)
++            assert blocked.value.called is True
++            assert blocked.value.delivery_phase == "may_have_been_sent"
++            assert blocked.value.state["category"] == "unknown_outcome"
++            assert resumed.inspect().state == "ambiguous"
++            assert resumed.inspect().phase == "may_have_been_sent"
++            assert restarted.state["in_flight"] is None
++            assert restarted.state["attempts"] == 1
++            assert restarted.state["phase"] == "exhausted"
++            assert calls == []
++        finally:
++            await restarted_client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_health_write_error_after_atomic_install_replays_without_double_charge(
++        tmp_path, monkeypatch):
++    from jev_factorio import provider_health as health_module
++
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        clock = Clock()
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        seed = ProviderCircuit(client, health_path, clock=clock)
++        existing_incident = "incident-before-lease"
++        preexisting = deepcopy(seed.state)
++        preexisting.update(
++            phase="cooldown", category="rate_limit", attempts=1,
++            next_probe_at=900.0, incident_id=existing_incident,
++            first_failure_at=950.0, budget_category="rate_limit", budget_limit=8,
++        )
++        health_module.atomic_json(health_path, preexisting)
++        circuit = ProviderCircuit(client, health_path, clock=clock)
++        request_identity = _identity("health-install-then-error")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        real_atomic_json = health_module.atomic_json
++
++        def install_then_raise(path, value):
++            real_atomic_json(path, value)
++            if (path == health_path and value.get("in_flight") is None
++                    and value.get("decision_outcome", {}).get("state") == "response_received"):
++                raise OSError("injected post-install health durability error")
++
++        monkeypatch.setattr(health_module, "atomic_json", install_then_raise)
++        try:
++            with pytest.raises(OSError, match="post-install health"):
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++            committed = health_path.read_bytes()
++            committed_state = json.loads(committed)
++            assert calls and len(calls) == 1
++            assert committed_state["in_flight"] is None
++            assert committed_state["phase"] == "healthy"
++            assert committed_state["attempts"] == 0
++            assert committed_state["previous_incident"]["incident_id"] == existing_incident
++            assert lease.inspect().state == "response_received"
++        finally:
++            monkeypatch.setattr(health_module, "atomic_json", real_atomic_json)
++            await client.aclose()
++
++        replay_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(handler))
++        replay = ProviderCircuit(replay_client, health_path, clock=clock)
++        replay_lease = replay.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            result = await replay.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity,
++                decision_lease=replay_lease)
++        finally:
++            await replay_client.aclose()
++        assert result.identity is request_identity
++        assert len(calls) == 1
++        assert health_path.read_bytes() == committed
++        assert replay.state["attempts"] == 0
++        assert replay.state["previous_incident"]["incident_id"] == existing_incident
++
++    asyncio.run(exercise())
++
++
++def test_restart_rejects_coherent_external_incident_and_budget_rewrite(tmp_path):
++    from jev_factorio.operational_safety import atomic_json, SafetyStateError
++
++    calls = []
++
++    async def exercise():
++        entered, return_response = asyncio.Event(), asyncio.Event()
++
++        async def handler(request):
++            calls.append(request)
++            entered.set()
++            await return_response.wait()
++            return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, health_path, clock=Clock())
++        request_identity = _identity("external-budget-change")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        task = asyncio.create_task(circuit.evaluate_async(
++            STATE, QUESTIONS, identity=request_identity, decision_lease=lease))
++        try:
++            await entered.wait()
++            current = json.loads(health_path.read_text())
++            flight = current["in_flight"]
++            changed_before = deepcopy(flight["decision_before"])
++            changed_before.update(
++                phase="cooldown", category="rate_limit", attempts=1,
++                next_probe_at=900.0, incident_id="external-incident",
++                first_failure_at=950.0, budget_category="rate_limit", budget_limit=8,
++            )
++            flight["healthy_start"] = False
++            changed_current = circuit._decision_reserved_state(changed_before, flight)
++            # The modified incident/budget and its reservation are internally
++            # coherent, but disagree with the immutable WAL-bound old baseline.
++            atomic_json(health_path, changed_current)
++            changed_bytes = health_path.read_bytes()
++            return_response.set()
++            with pytest.raises(SafetyStateError, match="pre-attempt health digest"):
++                await task
++            assert health_path.read_bytes() == changed_bytes
++            assert len(calls) == 1
++            assert lease.inspect().state == "response_received"
++            with pytest.raises(SafetyStateError, match="pre-attempt health digest"):
++                ProviderCircuit(client, health_path, clock=Clock())
++        finally:
++            return_response.set()
++            await client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_authorized_recovery_v1_reproduction_reaches_wal_response_and_restart(tmp_path):
++    """Exercise the original public-call failure before checking restart recovery."""
++    from jev_factorio.operational_safety import atomic_json
++
++    async def exercise():
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        client = AsyncMockJevClient()
++        circuit = ProviderCircuit(client, health_path, clock=Clock())
++        circuit.state.update(
++            phase="exhausted", incident_id=str(uuid4()), category="service_network",
++            attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
++            budget_category="service_network", budget_limit=8,
++        )
++        circuit._save()
++        authorization = {
++            "request_id": str(uuid4()),
++            "incident_id": circuit.state["incident_id"],
++            "evidence_sha256": "a" * 64,
++        }
++        atomic_json(tmp_path / "provider-authorization.json", authorization)
++        request_identity = _identity("v1-authorized-recovery")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity,
++        )
++
++        evaluation_error = None
++        result = None
++        try:
++            result = await circuit.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity, decision_lease=lease,
++            )
++        except SafetyStateError as error:
++            evaluation_error = str(error)
++        assert lease.inspect().state == "response_received"
++
++        restart_error = None
++        try:
++            ProviderCircuit(client, health_path, clock=Clock())
++        except SafetyStateError as error:
++            restart_error = str(error)
++        assert evaluation_error is None, (
++            f"public evaluate failed after a durable WAL response: {evaluation_error}; "
++            f"restart_error={restart_error}"
++        )
++        assert restart_error is None
++        assert result is not None
++
++    asyncio.run(exercise())
++
++
++def test_authorized_recovery_binds_post_admission_health_and_replays_exact_result(tmp_path):
++    from jev_factorio.operational_safety import atomic_json
++    from jev_factorio.provider_decision_wal import canonical_sha256
++
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, health_path, clock=Clock())
++        circuit.state.update(
++            phase="exhausted", incident_id=str(uuid4()), category="service_network",
++            attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
++            budget_category="service_network", budget_limit=8,
++        )
++        circuit._save()
++        prior_incident = deepcopy(circuit.state)
++        authorization = {
++            "request_id": str(uuid4()),
++            "incident_id": circuit.state["incident_id"],
++            "evidence_sha256": "a" * 64,
++        }
++        atomic_json(tmp_path / "provider-authorization.json", authorization)
++        request_identity = _identity("authorized-recovery")
++        restarted_client = None
++
++        try:
++            lease = circuit.prepare_decision_lease(
++                wal, STATE, QUESTIONS, identity=request_identity,
++            )
++            authorized_state = json.loads(health_path.read_text(encoding="utf-8"))
++            history = json.loads((tmp_path / (
++                "provider-authorized-" + authorization["request_id"] + ".json"
++            )).read_text(encoding="utf-8"))
++            assert history == {"request": authorization, "previous_state": prior_incident}
++            assert authorized_state["incident_id"] == prior_incident["incident_id"]
++            assert authorized_state["first_failure_at"] == prior_incident["first_failure_at"]
++            assert authorized_state["category"] == prior_incident["category"]
++            assert authorized_state["authorization_id"] == authorization["request_id"]
++            assert authorized_state["attempts"] == 0
++            assert authorized_state["budget_category"] is None
++            assert authorized_state["budget_limit"] is None
++            assert lease.health_state_sha256 == canonical_sha256(authorized_state)
++
++            result = await circuit.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity, decision_lease=lease,
++            )
++            replay = await circuit.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity, decision_lease=lease,
++            )
++            assert result == replay
++            assert lease.inspect().state == "response_received"
++            assert circuit.state["in_flight"] is None
++            assert circuit.state["previous_incident"]["incident_id"] == prior_incident["incident_id"]
++            assert len(calls) == 1
++
++            restarted_client = AsyncJevClient(
++                api_key="offline", transport=httpx.MockTransport(handler),
++            )
++            restarted = ProviderCircuit(restarted_client, health_path, clock=Clock())
++            restarted_lease = restarted.prepare_decision_lease(
++                wal, STATE, QUESTIONS, identity=request_identity,
++            )
++            recovered = await restarted.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity,
++                decision_lease=restarted_lease,
++            )
++            assert recovered == result
++            assert restarted.state["authorization_id"] == authorization["request_id"]
++            assert len(calls) == 1
++        finally:
++            await client.aclose()
++            if restarted_client is not None:
++                await restarted_client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_new_authorization_cannot_rebind_an_already_prepared_lease(tmp_path):
++    from jev_factorio.operational_safety import atomic_json
++
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, health_path, clock=Clock())
++        circuit.state.update(
++            phase="exhausted", incident_id=str(uuid4()), category="service_network",
++            attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
++            budget_category="service_network", budget_limit=8,
++        )
++        circuit._save()
++        prior_incident = deepcopy(circuit.state)
++        request_identity = _identity("authorization-after-lease")
++        old_lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity,
++        )
++        old_health = health_path.read_bytes()
++        authorization = {
++            "request_id": str(uuid4()),
++            "incident_id": prior_incident["incident_id"],
++            "evidence_sha256": "b" * 64,
++        }
++        atomic_json(tmp_path / "provider-authorization.json", authorization)
++
++        try:
++            with pytest.raises(SafetyStateError, match="changed after decision lease"):
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=old_lease,
++                )
++            assert old_lease.inspect_optional() is None
++            assert health_path.read_bytes() == old_health
++            assert json.loads(wal.path.read_text())["records"] == []
++            assert calls == []
++
++            retry = circuit.prepare_decision_lease(
++                wal, STATE, QUESTIONS, identity=request_identity,
++            )
++            admitted = json.loads(health_path.read_text())
++            assert retry.health_state_sha256 == wal_module.canonical_sha256(admitted)
++            assert admitted["authorization_id"] == authorization["request_id"]
++            result = await circuit.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity, decision_lease=retry,
++            )
++            assert result.answers["ready"]["choice"] == "yes"
++            assert len(calls) == 1
++            history = json.loads((tmp_path / (
++                "provider-authorized-" + authorization["request_id"] + ".json"
++            )).read_text())
++            assert history == {"request": authorization, "previous_state": prior_incident}
++        finally:
++            await client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_authorization_history_write_failure_leaves_health_and_wal_untouched(
++        tmp_path, monkeypatch):
++    from jev_factorio import provider_health as health_module
++    from jev_factorio.operational_safety import atomic_json
++
++    health_path = tmp_path / "health.json"
++    wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++    client = AsyncMockJevClient()
++    circuit = ProviderCircuit(client, health_path, clock=Clock())
++    circuit.state.update(
++        phase="exhausted", incident_id=str(uuid4()), category="service_network",
++        attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
++        budget_category="service_network", budget_limit=8,
++    )
++    circuit._save()
++    prior = deepcopy(circuit.state)
++    health_before = health_path.read_bytes()
++    authorization = {
++        "request_id": str(uuid4()), "incident_id": prior["incident_id"],
++        "evidence_sha256": "c" * 64,
++    }
++    atomic_json(tmp_path / "provider-authorization.json", authorization)
++    history_path = tmp_path / ("provider-authorized-" + authorization["request_id"] + ".json")
++    real_atomic_json = health_module.atomic_json
++
++    def fail_history(path, value):
++        if Path(path) == history_path:
++            raise OSError("injected authorization-history write failure")
++        real_atomic_json(path, value)
++
++    monkeypatch.setattr(health_module, "atomic_json", fail_history)
++    with pytest.raises(OSError, match="authorization-history write failure"):
++        circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=_identity("auth-history-write-failure"),
++        )
++    assert health_path.read_bytes() == health_before
++    assert not history_path.exists()
++    assert json.loads(wal.path.read_text())["records"] == []
++    assert circuit.state == prior
++
++
++def test_authorization_history_survives_health_preinstall_failure_and_restart_retry(
++        tmp_path, monkeypatch):
++    from jev_factorio import provider_health as health_module
++    from jev_factorio.operational_safety import atomic_json
++
++    health_path = tmp_path / "health.json"
++    wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++    client = AsyncMockJevClient()
++    circuit = ProviderCircuit(client, health_path, clock=Clock())
++    circuit.state.update(
++        phase="exhausted", incident_id=str(uuid4()), category="service_network",
++        attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
++        budget_category="service_network", budget_limit=8,
++    )
++    circuit._save()
++    prior = deepcopy(circuit.state)
++    health_before = health_path.read_bytes()
++    authorization = {
++        "request_id": str(uuid4()), "incident_id": prior["incident_id"],
++        "evidence_sha256": "d" * 64,
++    }
++    atomic_json(tmp_path / "provider-authorization.json", authorization)
++    history_path = tmp_path / ("provider-authorized-" + authorization["request_id"] + ".json")
++    real_atomic_json = health_module.atomic_json
++
++    def fail_health_before_install(path, value):
++        if Path(path) == health_path:
++            raise OSError("injected health preinstall failure")
++        real_atomic_json(path, value)
++
++    monkeypatch.setattr(health_module, "atomic_json", fail_health_before_install)
++    with pytest.raises(OSError, match="health preinstall failure"):
++        circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=_identity("auth-preinstall-failure"),
++        )
++    assert health_path.read_bytes() == health_before
++    assert history_path.exists()
++    assert json.loads(history_path.read_text()) == {"request": authorization, "previous_state": prior}
++    assert json.loads(wal.path.read_text())["records"] == []
++
++    monkeypatch.setattr(health_module, "atomic_json", real_atomic_json)
++    restarted = ProviderCircuit(client, health_path, clock=Clock())
++    lease = restarted.prepare_decision_lease(
++        wal, STATE, QUESTIONS, identity=_identity("auth-preinstall-retry"),
++    )
++    admitted = json.loads(health_path.read_text())
++    assert admitted["authorization_id"] == authorization["request_id"]
++    assert admitted["attempts"] == 0
++    assert admitted["incident_id"] == prior["incident_id"]
++    assert lease.health_state_sha256 == wal_module.canonical_sha256(admitted)
++    assert json.loads(history_path.read_text()) == {"request": authorization, "previous_state": prior}
++    assert json.loads(wal.path.read_text())["records"] == []
++
++
++def test_authorization_postinstall_error_is_recovered_without_budget_reset(tmp_path, monkeypatch):
++    from jev_factorio import provider_health as health_module
++    from jev_factorio.operational_safety import atomic_json
++
++    health_path = tmp_path / "health.json"
++    wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++    client = AsyncMockJevClient()
++    circuit = ProviderCircuit(client, health_path, clock=Clock())
++    circuit.state.update(
++        phase="exhausted", incident_id=str(uuid4()), category="service_network",
++        attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
++        budget_category="service_network", budget_limit=8,
++    )
++    circuit._save()
++    prior = deepcopy(circuit.state)
++    authorization = {
++        "request_id": str(uuid4()), "incident_id": prior["incident_id"],
++        "evidence_sha256": "e" * 64,
++    }
++    atomic_json(tmp_path / "provider-authorization.json", authorization)
++    history_path = tmp_path / ("provider-authorized-" + authorization["request_id"] + ".json")
++    real_atomic_json = health_module.atomic_json
++
++    def install_then_raise(path, value):
++        real_atomic_json(path, value)
++        if Path(path) == health_path:
++            raise OSError("injected postinstall health fsync ambiguity")
++
++    monkeypatch.setattr(health_module, "atomic_json", install_then_raise)
++    with pytest.raises(OSError, match="postinstall health fsync ambiguity"):
++        circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=_identity("auth-postinstall-error"),
++        )
++    committed = health_path.read_bytes()
++    history_bytes = history_path.read_bytes()
++    committed_state = json.loads(committed)
++    assert committed_state["authorization_id"] == authorization["request_id"]
++    assert committed_state["attempts"] == 0
++    assert json.loads(history_bytes) == {"request": authorization, "previous_state": prior}
++
++    monkeypatch.setattr(health_module, "atomic_json", real_atomic_json)
++    restarted = ProviderCircuit(client, health_path, clock=Clock())
++    lease = restarted.prepare_decision_lease(
++        wal, STATE, QUESTIONS, identity=_identity("auth-postinstall-restart"),
++    )
++    assert health_path.read_bytes() == committed
++    assert history_path.read_bytes() == history_bytes
++    assert lease.health_state_sha256 == wal_module.canonical_sha256(committed_state)
++    assert json.loads(wal.path.read_text())["records"] == []
++
++
++def test_authorized_not_sent_admission_restores_post_authorization_budget(tmp_path):
++    from jev_factorio.operational_safety import atomic_json
++
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, health_path, clock=Clock())
++        circuit.state.update(
++            phase="exhausted", incident_id=str(uuid4()), category="service_network",
++            attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
++            budget_category="service_network", budget_limit=8,
++        )
++        circuit._save()
++        prior_incident = deepcopy(circuit.state)
++        authorization = {
++            "request_id": str(uuid4()), "incident_id": prior_incident["incident_id"],
++            "evidence_sha256": "2" * 64,
++        }
++        atomic_json(tmp_path / "provider-authorization.json", authorization)
++        request_identity = _identity("authorized-deadline")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity,
++        )
++        admitted = deepcopy(circuit.state)
++        history_path = tmp_path / ("provider-authorized-" + authorization["request_id"] + ".json")
++        history_bytes = history_path.read_bytes()
++        try:
++            with pytest.raises(AsyncProviderDeadlineExceeded):
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease,
++                    deadline=time.monotonic() - 1,
++                )
++            assert lease.inspect().state == "failed"
++            assert lease.inspect().phase == "not_sent"
++            assert lease.inspect().error_category == "local_admission"
++            assert circuit.state == admitted
++            assert json.loads(health_path.read_text()) == admitted
++            assert history_path.read_bytes() == history_bytes
++            assert calls == []
++            with pytest.raises(AsyncProviderLocalError):
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease,
++                )
++            assert json.loads(health_path.read_text()) == admitted
++            assert calls == []
++
++            retry_identity = _identity("authorized-after-deadline")
++            retry_lease = circuit.prepare_decision_lease(
++                wal, STATE, QUESTIONS, identity=retry_identity,
++            )
++            assert json.loads(health_path.read_text()) == admitted
++            result = await circuit.evaluate_async(
++                STATE, QUESTIONS, identity=retry_identity, decision_lease=retry_lease,
++            )
++            assert result.answers["ready"]["choice"] == "yes"
++            assert retry_lease.inspect().state == "response_received"
++            assert circuit.state["authorization_id"] == authorization["request_id"]
++            assert history_path.read_bytes() == history_bytes
++            assert json.loads(history_bytes) == {
++                "request": authorization, "previous_state": prior_incident,
++            }
++            assert len(calls) == 1
++        finally:
++            await client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_new_authorization_does_not_supersede_may_have_been_sent_flight(tmp_path):
++    from jev_factorio.operational_safety import atomic_json
++
++    async def exercise():
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        client = AsyncMockJevClient()
++        circuit = ProviderCircuit(client, health_path, clock=Clock())
++        circuit.state.update(
++            phase="cooldown", incident_id=str(uuid4()), category="service_network",
++            attempts=2, first_failure_at=900.0, next_probe_at=1005.0,
++            budget_category="service_network", budget_limit=8,
++        )
++        circuit._save()
++        identity = _identity("authorization-after-may")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=identity,
++        )
++        before = deepcopy(circuit.state)
++        lease.reserve()
++        flight = {
++            "request_id": identity.request_id,
++            "started_at": circuit.clock(),
++            "healthy_start": False,
++            "decision_binding": lease.binding(),
++            "authorization_sha256": circuit._decision_auth_digest(),
++        }
++        circuit.state = circuit._decision_reserved_state(before, flight)
++        circuit._save_decision_state(before)
++        lease.mark_may_have_been_sent()
++        request_bytes = health_path.read_bytes()
++        wal_bytes = wal.path.read_bytes()
++        authorization = {
++            "request_id": str(uuid4()),
++            "incident_id": before["incident_id"],
++            "evidence_sha256": "3" * 64,
++        }
++        atomic_json(tmp_path / "provider-authorization.json", authorization)
++        history_path = tmp_path / ("provider-authorized-" + authorization["request_id"] + ".json")
++
++        restarted = ProviderCircuit(client, health_path, clock=Clock())
++        resumed = restarted.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=identity,
++        )
++        try:
++            with pytest.raises(SafetyStateError, match="authorization changed during a decision"):
++                await restarted.evaluate_async(
++                    STATE, QUESTIONS, identity=identity, decision_lease=resumed,
++                )
++            assert health_path.read_bytes() == request_bytes
++            assert wal.path.read_bytes() == wal_bytes
++            assert resumed.inspect().state == "may_have_been_sent"
++            assert not history_path.exists()
++        finally:
++            await client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_authorized_response_survives_release_cancellation_and_replays_once(tmp_path):
++    from jev_factorio.operational_safety import atomic_json
++
++    calls = []
++
++    async def exercise():
++        entered, answer, release_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
++
++        async def handler(request):
++            calls.append(request)
++            entered.set()
++            await answer.wait()
++            return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, health_path, clock=Clock())
++        circuit.state.update(
++            phase="exhausted", incident_id=str(uuid4()), category="service_network",
++            attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
++            budget_category="service_network", budget_limit=8,
++        )
++        circuit._save()
++        prior_incident = deepcopy(circuit.state)
++        authorization = {
++            "request_id": str(uuid4()), "incident_id": prior_incident["incident_id"],
++            "evidence_sha256": "f" * 64,
++        }
++        atomic_json(tmp_path / "provider-authorization.json", authorization)
++        request_identity = _identity("authorized-release-cancel")
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity,
++        )
++        history_path = tmp_path / ("provider-authorized-" + authorization["request_id"] + ".json")
++        history_bytes = history_path.read_bytes()
++        original_release = client._release
++
++        async def observe_release():
++            release_started.set()
++            return await original_release()
++
++        client._release = observe_release
++        task = asyncio.create_task(circuit.evaluate_async(
++            STATE, QUESTIONS, identity=request_identity, decision_lease=lease))
++        await entered.wait()
++        await client._condition.acquire()
++        try:
++            answer.set()
++            await asyncio.wait_for(release_started.wait(), timeout=2)
++            assert lease.inspect().state == "response_received"
++            task.cancel()
++            await asyncio.sleep(0)
++            task.cancel()
++            await asyncio.sleep(0)
++            assert not task.done()
++        finally:
++            client._condition.release()
++        with pytest.raises(AsyncProviderCancelled) as cancelled:
++            await task
++        assert cancelled.value.delivery_phase == "response_received"
++        assert lease.inspect().state == "response_received"
++        assert json.loads(health_path.read_text())["in_flight"] is not None
++        assert json.loads(health_path.read_text())["authorization_id"] == authorization["request_id"]
++        assert json.loads(history_bytes) == {
++            "request": authorization, "previous_state": prior_incident,
++        }
++        assert len(calls) == 1
++        await client.aclose()
++
++        replay_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(handler),
++        )
++        replay = ProviderCircuit(replay_client, health_path, clock=Clock())
++        replay_lease = replay.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity,
++        )
++        try:
++            result = await replay.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity,
++                decision_lease=replay_lease,
++            )
++        finally:
++            await replay_client.aclose()
++        assert result.answers["ready"]["choice"] == "yes"
++        assert replay.state["authorization_id"] == authorization["request_id"]
++        assert replay.state["previous_incident"]["incident_id"] == prior_incident["incident_id"]
++        assert history_path.read_bytes() == history_bytes
++        assert len(calls) == 1
++
++    asyncio.run(exercise())
++
++
++def test_operator_authorization_archives_terminal_wal_failure_before_new_probe(tmp_path):
++    from jev_factorio.operational_safety import atomic_json
++
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        if len(calls) == 1:
++            return httpx.Response(429, json={"error": "offline rate limit"}, request=request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, health_path, clock=Clock())
++        failed_identity = _identity("before-operator-probe")
++        failed_lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=failed_identity,
++        )
++        try:
++            with pytest.raises(ProviderBlocked):
++                await circuit.evaluate_async(
++                    STATE, QUESTIONS, identity=failed_identity,
++                    decision_lease=failed_lease,
++                )
++        finally:
++            await client.aclose()
++
++        assert failed_lease.inspect().state == "failed"
++        assert circuit.state["decision_outcome"]["state"] == "failed"
++        prior_failure = deepcopy(circuit.state)
++        authorization = {
++            "request_id": str(uuid4()),
++            "incident_id": prior_failure["incident_id"],
++            "evidence_sha256": "1" * 64,
++        }
++        atomic_json(tmp_path / "provider-authorization.json", authorization)
++
++        retry_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(handler),
++        )
++        retry_circuit = ProviderCircuit(retry_client, health_path, clock=Clock())
++        alternate_wal = ProviderDecisionWAL.initialize(tmp_path / "alternate-wal.json")
++        before_wrong_wal = health_path.read_bytes()
++        with pytest.raises(SafetyStateError, match="bound to another WAL"):
++            retry_circuit.prepare_decision_lease(
++                alternate_wal, STATE, QUESTIONS,
++                identity=_identity("wrong-wal-operator-probe"),
++            )
++        assert health_path.read_bytes() == before_wrong_wal
++        assert json.loads(alternate_wal.path.read_text())["records"] == []
++
++        retry_identity = _identity("after-operator-probe")
++        retry_lease = retry_circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=retry_identity,
++        )
++        authorized_state = json.loads(health_path.read_text())
++        history_path = tmp_path / ("provider-authorized-" + authorization["request_id"] + ".json")
++        history = json.loads(history_path.read_text())
++        assert history == {"request": authorization, "previous_state": prior_failure}
++        assert "decision_outcome" not in authorized_state
++        assert authorized_state["incident_id"] == prior_failure["incident_id"]
++        assert authorized_state["authorization_id"] == authorization["request_id"]
++        assert retry_lease.health_state_sha256 == wal_module.canonical_sha256(authorized_state)
++        try:
++            result = await retry_circuit.evaluate_async(
++                STATE, QUESTIONS, identity=retry_identity, decision_lease=retry_lease,
++            )
++        finally:
++            await retry_client.aclose()
++        assert result.answers["ready"]["choice"] == "yes"
++        assert failed_lease.inspect().error_category == "rate_limit"
++        assert len(calls) == 2
++
++    asyncio.run(exercise())
++
++
++def test_completed_health_outcome_detects_later_incident_or_cooldown_change(tmp_path):
++    from jev_factorio.operational_safety import atomic_json, SafetyStateError
++
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        request_identity = _identity("post-completion-external-change")
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, health_path, clock=Clock())
++        lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=request_identity)
++        try:
++            await circuit.evaluate_async(
++                STATE, QUESTIONS, identity=request_identity, decision_lease=lease)
++        finally:
++            await client.aclose()
++        assert len(calls) == 1
++
++        changed = json.loads(health_path.read_text())
++        changed.update(
++            phase="exhausted", category="rate_limit", attempts=8,
++            next_probe_at=5000.0, incident_id="independent-post-result-incident",
++            first_failure_at=1200.0, budget_category="rate_limit", budget_limit=8,
++        )
++        atomic_json(health_path, changed)
++        preserved = health_path.read_bytes()
++
++        replay_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(handler))
++        try:
++            with pytest.raises(SafetyStateError, match="completed health state changed"):
++                ProviderCircuit(replay_client, health_path, clock=Clock())
++            assert health_path.read_bytes() == preserved
++            assert len(calls) == 1
++        finally:
++            await replay_client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_unconsumed_response_blocks_a_new_identity_on_the_health_sidecar(tmp_path):
++    from jev_factorio.provider_health import SafetyStateError
++
++    calls = []
++
++    def handler(request):
++        calls.append(request)
++        return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++    async def exercise():
++        health_path = tmp_path / "health.json"
++        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++        client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
++        circuit = ProviderCircuit(client, health_path)
++        first_identity = _identity("unconsumed-first")
++        first_lease = circuit.prepare_decision_lease(
++            wal, STATE, QUESTIONS, identity=first_identity)
++        try:
++            await circuit.evaluate_async(
++                STATE, QUESTIONS, identity=first_identity, decision_lease=first_lease)
++            preserved = health_path.read_bytes()
++            with pytest.raises(SafetyStateError, match="must be replayed or consumed"):
++                circuit.prepare_decision_lease(
++                    wal, STATE, QUESTIONS, identity=_identity("unconsumed-second"))
++            assert health_path.read_bytes() == preserved
++            assert first_lease.inspect().state == "response_received"
++            assert len(calls) == 1
++        finally:
++            await client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_two_circuit_instances_cannot_dispatch_against_one_health_owner(tmp_path):
++    first_calls, second_calls = [], []
++
++    async def exercise():
++        entered, release = asyncio.Event(), asyncio.Event()
++
++        async def first_handler(request):
++            first_calls.append(request)
++            entered.set()
++            await release.wait()
++            return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++        def second_handler(request):
++            second_calls.append(request)
++            return httpx.Response(200, json={"answers": _answers()}, request=request)
++
++        health_path = tmp_path / "health.json"
++        first_wal = ProviderDecisionWAL.initialize(tmp_path / "first-wal.json")
++        second_wal = ProviderDecisionWAL.initialize(tmp_path / "second-wal.json")
++        first_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(first_handler))
++        second_client = AsyncJevClient(
++            api_key="offline", transport=httpx.MockTransport(second_handler))
++        first = ProviderCircuit(first_client, health_path)
++        second = ProviderCircuit(second_client, health_path)
++        first_identity, second_identity = _identity("owner-first"), _identity("owner-second")
++        first_lease = first.prepare_decision_lease(
++            first_wal, STATE, QUESTIONS, identity=first_identity)
++        second_lease = second.prepare_decision_lease(
++            second_wal, STATE, QUESTIONS, identity=second_identity)
++        first_task = asyncio.create_task(first.evaluate_async(
++            STATE, QUESTIONS, identity=first_identity, decision_lease=first_lease))
++        try:
++            await entered.wait()
++            owner_bytes = health_path.read_bytes()
++            with pytest.raises(WALBusyError):
++                await second.evaluate_async(
++                    STATE, QUESTIONS, identity=second_identity,
++                    decision_lease=second_lease)
++            assert health_path.read_bytes() == owner_bytes
++            assert first_lease.inspect().state == "may_have_been_sent"
++            assert second_lease.inspect_optional() is None
++            assert len(first_calls) == 1
++            assert second_calls == []
++            release.set()
++            result = await first_task
++            assert result.identity is first_identity
++            assert first_lease.inspect().state == "response_received"
++            assert first.state["decision_outcome"]["identity"]["request_id"] == (
++                first_identity.request_id)
++            assert len(first_calls) == 1 and second_calls == []
++            with pytest.raises(SafetyStateError, match="another WAL"):
++                await second.evaluate_async(
++                    STATE, QUESTIONS, identity=second_identity,
++                    decision_lease=second_lease)
++            assert second_lease.inspect_optional() is None
++            assert second_calls == []
++        finally:
++            release.set()
++            if not first_task.done():
++                await first_task
++            await first_client.aclose()
++            await second_client.aclose()
++
++    asyncio.run(exercise())
++
++
++def test_other_process_health_owner_lock_blocks_before_lease_mutation(tmp_path):
++    calls = []
++    health_path = tmp_path / "health.json"
++    wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
++    client = AsyncJevClient(
++        api_key="offline", transport=httpx.MockTransport(
++            lambda request: calls.append(request) or httpx.Response(
++                200, json={"answers": _answers()}, request=request)))
++    circuit = ProviderCircuit(client, health_path)
++    identity = _identity("other-process-owner")
++    lease = circuit.prepare_decision_lease(wal, STATE, QUESTIONS, identity=identity)
++    source = (
++        "from pathlib import Path\n"
++        "import sys\n"
++        "from jev_factorio.provider_decision_wal import _writer_lock\n"
++        "with _writer_lock(Path(sys.argv[1])):\n"
++        " print('LOCKED', flush=True)\n"
++        " sys.stdin.readline()\n"
++    )
++    process = subprocess.Popen(
++        [sys.executable, "-c", source, str(health_path)],
++        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        text=True,
++    )
++    try:
++        assert process.stdout.readline().strip() == "LOCKED"
++        original_state = deepcopy(circuit.state)
++        with pytest.raises(WALBusyError):
++            asyncio.run(circuit.evaluate_async(
++                STATE, QUESTIONS, identity=identity, decision_lease=lease))
++        assert circuit.state == original_state
++        assert not health_path.exists()
++        assert lease.inspect_optional() is None
++        assert calls == []
++    finally:
++        if process.poll() is None:
++            process.stdin.write("release\n")
++            process.stdin.flush()
++        process.wait(timeout=5)
++        asyncio.run(client.aclose())
+diff --git a/tests/test_provider_decision_wal.py b/tests/test_provider_decision_wal.py
+index cb826354..3d1584e3 100644
+--- a/tests/test_provider_decision_wal.py
++++ b/tests/test_provider_decision_wal.py
+@@ -239,6 +239,40 @@ def test_response_error_records_received_phase_without_saving_raw_error_body(tmp
+     assert "raw response body" not in text
+ 
+ 
++def test_retry_after_is_stored_only_as_bounded_source_clock_projection(tmp_path):
++    path, wal = create(tmp_path)
++    binding = identity()
++    original = request()
++    wal.reserve(binding, original)
++    wal.mark_may_have_been_sent(binding, original)
++    failed = wal.record_error(
++        binding, original, "rate_limit", RESPONSE_RECEIVED,
++        http_status=429,
++        cooldown={"received_at": 1000.0, "retry_after_seconds": 12.0},
++    )
++    assert failed.http_status == 429
++    assert dict(failed.cooldown) == {
++        "received_at": 1000.0, "retry_after_seconds": 12.0}
++    reopened = ProviderDecisionWAL(path).inspect(binding, original)
++    assert reopened == failed
++    text = path.read_text(encoding="utf-8")
++    assert "Retry-After" not in text
++    assert "raw response" not in text
++    with pytest.raises(ValueError, match="outside its bound"):
++        wal.record_error(
++            binding, original, "rate_limit", RESPONSE_RECEIVED,
++            http_status=429,
++            cooldown={"received_at": 1000.0, "retry_after_seconds": 3601.0},
++        )
++    with pytest.raises(ValueError, match="HTTP status"):
++        wal.record_error(
++            identity(observation_id="observation-new", decision_id="decision-new",
++                     request_id="request-new"),
++            request(candidate_ids=["new"]), "rate_limit", MAY_HAVE_BEEN_SENT,
++            http_status=429,
++        )
++
++
+ def test_uncertain_atomic_write_failure_does_not_enter_provider_transport(tmp_path, monkeypatch):
+     path, wal = create(tmp_path)
+     binding = identity()

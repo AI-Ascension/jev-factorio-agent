@@ -1,0 +1,126 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_ test_authorized_recovery_binds_post_admission_health_and_replays_exact_result _
+
+tmp_path = PosixPath('/tmp/async273-auth-baseline/test_authorized_recovery_binds0')
+
+    def test_authorized_recovery_binds_post_admission_health_and_replays_exact_result(tmp_path):
+        from jev_factorio.operational_safety import atomic_json
+        from jev_factorio.provider_decision_wal import canonical_sha256
+    
+        calls = []
+    
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(200, json={"answers": _answers()}, request=request)
+    
+        async def exercise():
+            health_path = tmp_path / "health.json"
+            wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
+            client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
+            circuit = ProviderCircuit(client, health_path, clock=Clock())
+            circuit.state.update(
+                phase="exhausted", incident_id=str(uuid4()), category="service_network",
+                attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
+                budget_category="service_network", budget_limit=8,
+            )
+            circuit._save()
+            prior_incident = deepcopy(circuit.state)
+            authorization = {
+                "request_id": str(uuid4()),
+                "incident_id": circuit.state["incident_id"],
+                "evidence_sha256": "a" * 64,
+            }
+            atomic_json(tmp_path / "provider-authorization.json", authorization)
+            request_identity = _identity("authorized-recovery")
+            restarted_client = None
+    
+            try:
+                lease = circuit.prepare_decision_lease(
+                    wal, STATE, QUESTIONS, identity=request_identity,
+                )
+                authorized_state = json.loads(health_path.read_text(encoding="utf-8"))
+                history = json.loads((tmp_path / (
+                    "provider-authorized-" + authorization["request_id"] + ".json"
+                )).read_text(encoding="utf-8"))
+                assert history == {"request": authorization, "previous_state": prior_incident}
+                assert authorized_state["incident_id"] == prior_incident["incident_id"]
+                assert authorized_state["first_failure_at"] == prior_incident["first_failure_at"]
+                assert authorized_state["category"] == prior_incident["category"]
+                assert authorized_state["authorization_id"] == authorization["request_id"]
+                assert authorized_state["attempts"] == 0
+                assert authorized_state["budget_category"] is None
+                assert authorized_state["budget_limit"] is None
+                assert lease.health_state_sha256 == canonical_sha256(authorized_state)
+    
+                result = await circuit.evaluate_async(
+                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease,
+                )
+                replay = await circuit.evaluate_async(
+                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease,
+                )
+                assert result == replay
+                assert lease.inspect().state == "response_received"
+                assert circuit.state["in_flight"] is None
+                assert circuit.state["previous_incident"]["incident_id"] == prior_incident["incident_id"]
+                assert len(calls) == 1
+    
+                restarted_client = AsyncJevClient(
+                    api_key="offline", transport=httpx.MockTransport(handler),
+                )
+                restarted = ProviderCircuit(restarted_client, health_path, clock=Clock())
+                restarted_lease = restarted.prepare_decision_lease(
+                    wal, STATE, QUESTIONS, identity=request_identity,
+                )
+                recovered = await restarted.evaluate_async(
+                    STATE, QUESTIONS, identity=request_identity,
+                    decision_lease=restarted_lease,
+                )
+                assert recovered == result
+                assert restarted.state["authorization_id"] == authorization["request_id"]
+                assert len(calls) == 1
+            finally:
+                await client.aclose()
+                if restarted_client is not None:
+                    await restarted_client.aclose()
+    
+>       asyncio.run(exercise())
+
+tests/test_async_provider_wal.py:923: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/test_async_provider_wal.py:881: in exercise
+    )).read_text(encoding="utf-8"))
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/pathlib.py:1029: in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = PosixPath('/tmp/async273-auth-baseline/test_authorized_recovery_binds0/provider-authorized-9818225e-4b92-426d-aea6-f25fa76b0195.json')
+mode = 'r', buffering = -1, encoding = 'utf-8', errors = None, newline = None
+
+    def open(self, mode='r', buffering=-1, encoding=None,
+             errors=None, newline=None):
+        """
+        Open the file pointed by this path and return a file object, as
+        the built-in open() function does.
+        """
+        if "b" not in mode:
+            encoding = io.text_encoding(encoding)
+>       return io.open(self, mode, buffering, encoding, errors, newline)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       FileNotFoundError: [Errno 2] No such file or directory: '/tmp/async273-auth-baseline/test_authorized_recovery_binds0/provider-authorized-9818225e-4b92-426d-aea6-f25fa76b0195.json'
+
+/usr/lib/python3.12/pathlib.py:1015: FileNotFoundError
+=========================== short test summary info ============================
+FAILED tests/test_async_provider_wal.py::test_authorized_recovery_binds_post_admission_health_and_replays_exact_result
+1 failed in 1.77s

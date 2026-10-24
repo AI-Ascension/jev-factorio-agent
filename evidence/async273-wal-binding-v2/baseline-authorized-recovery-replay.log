@@ -1,0 +1,117 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+__ test_authorized_recovery_v1_reproduction_reaches_wal_response_and_restart ___
+
+tmp_path = PosixPath('/tmp/async273-auth-repro/test_authorized_recovery_v1_re0')
+
+    def test_authorized_recovery_v1_reproduction_reaches_wal_response_and_restart(tmp_path):
+        """Exercise the original public-call failure before checking restart recovery."""
+        from jev_factorio.operational_safety import atomic_json
+    
+        async def exercise():
+            health_path = tmp_path / "health.json"
+            wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
+            client = AsyncMockJevClient()
+            circuit = ProviderCircuit(client, health_path, clock=Clock())
+            circuit.state.update(
+                phase="exhausted", incident_id=str(uuid4()), category="service_network",
+                attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
+                budget_category="service_network", budget_limit=8,
+            )
+            circuit._save()
+            authorization = {
+                "request_id": str(uuid4()),
+                "incident_id": circuit.state["incident_id"],
+                "evidence_sha256": "a" * 64,
+            }
+            atomic_json(tmp_path / "provider-authorization.json", authorization)
+            request_identity = _identity("v1-authorized-recovery")
+            lease = circuit.prepare_decision_lease(
+                wal, STATE, QUESTIONS, identity=request_identity,
+            )
+    
+            evaluation_error = None
+            result = None
+            try:
+                result = await circuit.evaluate_async(
+                    STATE, QUESTIONS, identity=request_identity, decision_lease=lease,
+                )
+            except SafetyStateError as error:
+                evaluation_error = str(error)
+            assert lease.inspect().state == "response_received"
+    
+            restart_error = None
+            try:
+                ProviderCircuit(client, health_path, clock=Clock())
+            except SafetyStateError as error:
+                restart_error = str(error)
+            assert evaluation_error is None, (
+                f"public evaluate failed after a durable WAL response: {evaluation_error}; "
+                f"restart_error={restart_error}"
+            )
+            assert restart_error is None
+            assert result is not None
+    
+>       asyncio.run(exercise())
+
+tests/test_async_provider_wal.py:891: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    async def exercise():
+        health_path = tmp_path / "health.json"
+        wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
+        client = AsyncMockJevClient()
+        circuit = ProviderCircuit(client, health_path, clock=Clock())
+        circuit.state.update(
+            phase="exhausted", incident_id=str(uuid4()), category="service_network",
+            attempts=8, first_failure_at=900.0, next_probe_at=1100.0,
+            budget_category="service_network", budget_limit=8,
+        )
+        circuit._save()
+        authorization = {
+            "request_id": str(uuid4()),
+            "incident_id": circuit.state["incident_id"],
+            "evidence_sha256": "a" * 64,
+        }
+        atomic_json(tmp_path / "provider-authorization.json", authorization)
+        request_identity = _identity("v1-authorized-recovery")
+        lease = circuit.prepare_decision_lease(
+            wal, STATE, QUESTIONS, identity=request_identity,
+        )
+    
+        evaluation_error = None
+        result = None
+        try:
+            result = await circuit.evaluate_async(
+                STATE, QUESTIONS, identity=request_identity, decision_lease=lease,
+            )
+        except SafetyStateError as error:
+            evaluation_error = str(error)
+        assert lease.inspect().state == "response_received"
+    
+        restart_error = None
+        try:
+            ProviderCircuit(client, health_path, clock=Clock())
+        except SafetyStateError as error:
+            restart_error = str(error)
+>       assert evaluation_error is None, (
+            f"public evaluate failed after a durable WAL response: {evaluation_error}; "
+            f"restart_error={restart_error}"
+        )
+E       AssertionError: public evaluate failed after a durable WAL response: Provider decision pre-attempt health digest differs; restart_error=Provider decision pre-attempt health digest differs
+E       assert 'Provider decision pre-attempt health digest differs' is None
+
+tests/test_async_provider_wal.py:884: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_async_provider_wal.py::test_authorized_recovery_v1_reproduction_reaches_wal_response_and_restart
+1 failed in 2.05s

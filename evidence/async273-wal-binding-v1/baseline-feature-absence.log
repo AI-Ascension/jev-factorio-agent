@@ -1,0 +1,56 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+__________ test_public_mock_decision_lease_saves_before_health_clear ___________
+
+tmp_path = PosixPath('/tmp/pytest-of-timot/pytest-535/test_public_mock_decision_leas0')
+
+    def test_public_mock_decision_lease_saves_before_health_clear(tmp_path):
+        async def exercise():
+            client = AsyncMockJevClient()
+            circuit = ProviderCircuit(client, tmp_path / "health.json")
+            wal = ProviderDecisionWAL.initialize(tmp_path / "decision.json")
+            identity = _identity("mock")
+            lease = circuit.prepare_decision_lease(wal, STATE, QUESTIONS, identity=identity)
+    
+            result = await circuit.evaluate_async(
+                STATE, QUESTIONS, identity=identity, decision_lease=lease,
+            )
+    
+            record = lease.inspect()
+            assert result.identity is identity
+            assert record.state == "response_received"
+            assert record.identity.request_id == identity.request_id
+            assert circuit.state["in_flight"] is None
+            assert circuit.state["decision_outcome"]["result_sha256"] == record.result_sha256
+            assert circuit.state["decision_outcome"]["binding"]["decision_id"] == identity.decision_id
+    
+>       asyncio.run(exercise())
+
+tests/test_async_provider_wal.py:45: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/test_async_provider_wal.py:31: in exercise
+    lease = circuit.prepare_decision_lease(wal, STATE, QUESTIONS, identity=identity)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <jev_factorio.provider_health.ProviderCircuit object at 0x7a14f6972cc0>
+name = 'prepare_decision_lease'
+
+    def __getattr__(self, name):
+>       return getattr(self.client, name)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'AsyncMockJevClient' object has no attribute 'prepare_decision_lease'
+
+src/jev_factorio/provider_health.py:86: AttributeError
+=========================== short test summary info ============================
+FAILED tests/test_async_provider_wal.py::test_public_mock_decision_lease_saves_before_health_clear
+1 failed in 1.87s

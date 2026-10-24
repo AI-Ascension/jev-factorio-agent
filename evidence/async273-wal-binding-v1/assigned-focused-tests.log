@@ -1,0 +1,148 @@
+........................................................................ [ 55%]
+........................................................F.               [100%]
+=================================== FAILURES ===================================
+______ test_restart_rejects_coherent_external_incident_and_budget_rewrite ______
+
+tmp_path = PosixPath('/tmp/pytest-of-timot/pytest-564/test_restart_rejects_coherent_0')
+
+    def test_restart_rejects_coherent_external_incident_and_budget_rewrite(tmp_path):
+        from jev_factorio.operational_safety import atomic_json, SafetyStateError
+    
+        calls = []
+    
+        async def exercise():
+            entered, return_response = asyncio.Event(), asyncio.Event()
+    
+            async def handler(request):
+                calls.append(request)
+                entered.set()
+                await return_response.wait()
+                return httpx.Response(200, json={"answers": _answers()}, request=request)
+    
+            health_path = tmp_path / "health.json"
+            wal = ProviderDecisionWAL.initialize(tmp_path / "wal.json")
+            client = AsyncJevClient(api_key="offline", transport=httpx.MockTransport(handler))
+            circuit = ProviderCircuit(client, health_path, clock=Clock())
+            request_identity = _identity("external-budget-change")
+            lease = circuit.prepare_decision_lease(
+                wal, STATE, QUESTIONS, identity=request_identity)
+            task = asyncio.create_task(circuit.evaluate_async(
+                STATE, QUESTIONS, identity=request_identity, decision_lease=lease))
+            try:
+                await entered.wait()
+                current = json.loads(health_path.read_text())
+                flight = current["in_flight"]
+                changed_before = deepcopy(flight["decision_before"])
+                changed_before.update(
+                    phase="cooldown", category="rate_limit", attempts=1,
+                    next_probe_at=900.0, incident_id="external-incident",
+                    first_failure_at=950.0, budget_category="rate_limit", budget_limit=8,
+                )
+                flight["healthy_start"] = False
+                changed_current = circuit._decision_reserved_state(changed_before, flight)
+                # The modified incident/budget and its reservation are internally
+                # coherent, but disagree with the immutable WAL-bound old baseline.
+                atomic_json(health_path, changed_current)
+                changed_bytes = health_path.read_bytes()
+                return_response.set()
+                with pytest.raises(SafetyStateError, match="pre-attempt health digest"):
+                    await task
+                assert health_path.read_bytes() == changed_bytes
+                assert len(calls) == 1
+                assert lease.inspect().state == "response_received"
+                with pytest.raises(SafetyStateError, match="pre-attempt health digest"):
+                    ProviderCircuit(client, health_path, clock=Clock())
+            finally:
+                return_response.set()
+                await client.aclose()
+    
+            blocked_health_bytes = health_path.read_bytes()
+            restarted_client = AsyncJevClient(
+                api_key="offline", transport=httpx.MockTransport(handler))
+            restarted = ProviderCircuit(restarted_client, health_path)
+            restarted_lease = restarted.prepare_decision_lease(
+                wal, STATE, QUESTIONS, identity=request_identity)
+            try:
+                with pytest.raises(SafetyStateError, match="authorization changed"):
+                    await restarted.evaluate_async(
+                        STATE, QUESTIONS, identity=request_identity,
+                        decision_lease=restarted_lease)
+                assert health_path.read_bytes() == blocked_health_bytes
+                assert len(calls) == 1
+            finally:
+                await restarted_client.aclose()
+    
+>       asyncio.run(exercise())
+
+tests/test_async_provider_wal.py:850: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/asyncio/runners.py:194: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.12/asyncio/base_events.py:687: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+tests/test_async_provider_wal.py:837: in exercise
+    restarted = ProviderCircuit(restarted_client, health_path)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/jev_factorio/provider_health.py:77: in __init__
+    self._validate(stored)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <jev_factorio.provider_health.ProviderCircuit object at 0x78c6b8930ef0>
+value = {'attempts': 2, 'budget_category': 'rate_limit', 'budget_limit': 8, 'category': 'rate_limit', ...}
+
+    def _validate(self, value):
+        if (value.get("schema") != 1 or value.get("identity") != self.identity
+                or value.get("phase") not in {"healthy", "cooldown", "exhausted"}
+                or type(value.get("attempts")) is not int or value["attempts"] < 0
+                or type(value.get("next_probe_at")) not in (int, float)
+                or not math.isfinite(value["next_probe_at"])
+                or value.get("category") not in {None, "application_schema", "service_network",
+                    "authentication_authorization", "account_quota", "rate_limit", "unknown_outcome"}
+                or value.get("budget_category") not in {None, "application_schema", "service_network",
+                    "authentication_authorization", "account_quota", "rate_limit", "unknown_outcome"}
+                or (value.get("budget_limit") is not None
+                    and (type(value["budget_limit"]) is not int or value["budget_limit"] < 1))):
+            raise SafetyStateError("Provider circuit identity or schema differs")
+        outcome = value.get("decision_outcome")
+        if outcome is not None:
+            self._validate_decision_outcome(outcome)
+        flight = value.get("in_flight")
+        if flight is not None and (
+                not isinstance(flight, dict)
+                or not isinstance(flight.get("request_id"), str)
+                or len(flight["request_id"]) != 36
+                or any(c not in "0123456789abcdef-" for c in flight["request_id"])
+                or type(flight.get("started_at")) not in (int, float)
+                or not math.isfinite(flight["started_at"])
+                or type(flight.get("healthy_start")) is not bool):
+            raise SafetyStateError("Provider in-flight reservation is malformed")
+        if outcome is not None and flight is None:
+            from .provider_decision_wal import canonical_sha256
+            completed_state = deepcopy(value)
+            completed_state.pop("decision_outcome", None)
+            if canonical_sha256(completed_state) != outcome["health_result_sha256"]:
+                raise SafetyStateError("Provider decision completed health state changed")
+        if isinstance(flight, dict) and "decision_binding" in flight:
+            if set(flight) != {
+                    "request_id", "started_at", "healthy_start", "decision_binding",
+                    "decision_before", "authorization_sha256"}:
+                raise SafetyStateError("Provider decision flight fields are malformed")
+            self._validate_decision_binding(flight["decision_binding"])
+            before = flight["decision_before"]
+            if type(before) is not dict or before.get("in_flight") is not None:
+                raise SafetyStateError("Provider decision rollback snapshot is malformed")
+            self._validate(before)
+            from .provider_decision_wal import canonical_sha256
+            if canonical_sha256(before) != flight["decision_binding"]["health_state_sha256"]:
+>               raise SafetyStateError("Provider decision pre-attempt health digest differs")
+E               jev_factorio.operational_safety.SafetyStateError: Provider decision pre-attempt health digest differs
+
+src/jev_factorio/provider_health.py:182: SafetyStateError
+=========================== short test summary info ============================
+FAILED tests/test_async_provider_wal.py::test_restart_rejects_coherent_external_incident_and_budget_rewrite
+1 failed, 129 passed in 9.14s

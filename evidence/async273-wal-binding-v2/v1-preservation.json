@@ -1,0 +1,27 @@
+{
+  "status": "verified-unchanged",
+  "v1_handoff": {
+    "path": "handoffs/async273-wal-binding-v1.json",
+    "bytes": 13698,
+    "sha256": "D179C92CD1FF941BCFF77EA0F75980E35DF4F4B58A606317910DB091238F0E03"
+  },
+  "v1_full_patch": {
+    "path": "worktrees/async273-wal-binding/evidence/async273-wal-binding-v1/candidate-full.patch",
+    "bytes": 130308,
+    "sha256": "62BA0D1CDFD536B1F0777BAE5F07E867A63D91385CFE68D623A9392739988188"
+  },
+  "unchanged_candidate_files": [
+    "src/jev_factorio/async_provider.py",
+    "src/jev_factorio/jev_client.py",
+    "src/jev_factorio/provider_decision_wal.py",
+    "src/jev_factorio/decision_lease.py",
+    "tests/test_provider_decision_wal.py"
+  ],
+  "only_v1_candidate_files_changed_for_v2": [
+    "src/jev_factorio/provider_health.py",
+    "tests/test_async_provider_wal.py"
+  ],
+  "candidate_tree_v1": "cbbf95788c9743e49684475e407a36bb9ad54891",
+  "candidate_tree_v2": "0ee5d42b46fb0940325704b06136e642a33e7b63",
+  "verification": "v2 source/test hashes were compared with the frozen v1 handoff. The v1 handoff and full patch hashes remain identical to their frozen values."
+}
