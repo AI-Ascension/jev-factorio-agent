@@ -13,6 +13,7 @@ import math
 import os
 import platform
 import re
+import stat
 import subprocess
 import threading
 import time
@@ -31,6 +32,7 @@ MANIFEST_SCHEMA = "jev-factorio.manifest.v1"
 INTEGRITY_SCHEMA = "jev-factorio.integrity.v1"
 MAX_RECORD_BYTES = 1_048_576
 REDACTED = "[REDACTED]"
+RESEARCH_ROOT_FD_ENV = "JEV_RESEARCH_ROOT_FD"
 _HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EVENT_TYPE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\Z")
@@ -615,8 +617,100 @@ def _make_parents(path: Path) -> None:
     _sync_directory(path.parent)
 
 
+def open_research_output_parent(path: str | Path) -> int:
+    """Create/open a research parent by directory handle without following swaps.
+
+    The returned descriptor is intended for ``pass_fds`` to one supervised
+    child. Windows does not provide the descriptor-relative operations needed
+    by the reader, so supervised callers must fail closed there. Direct CLI
+    output remains available on all platforms.
+    """
+    if os.name == "nt" or not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("Supervised research output binding requires POSIX directory handles")
+    try:
+        target = Path(path).resolve(strict=False)
+        if not target.is_absolute():
+            raise ValueError("Research output parent must be absolute")
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+        current_fd = os.open(os.path.sep, flags)
+        try:
+            for part in target.parts[1:]:
+                if not part or part in {".", ".."}:
+                    raise ValueError("Research output parent has an unsafe path component")
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                next_fd = os.open(part, flags | os.O_NOFOLLOW, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            opened = os.fstat(current_fd)
+            visible = target.stat()
+            if (not stat.S_ISDIR(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)):
+                raise ValueError("Research output parent changed while it was being opened")
+            return current_fd
+        except BaseException:
+            os.close(current_fd)
+            raise
+    except (OSError, RuntimeError, TypeError) as error:
+        raise ValueError("Research output parent cannot be opened safely") from error
+
+
+def validate_research_output_parent(run_dir: str | Path, parent_fd: int) -> None:
+    """Require the selected path's current parent to name the pinned directory."""
+    if os.name == "nt":
+        raise ValueError("Supervised research output binding requires POSIX directory handles")
+    try:
+        parent = Path(run_dir).parent.resolve(strict=True)
+        visible = parent.stat()
+        opened = os.fstat(parent_fd)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("Research output destination changed before child open") from error
+    if (not stat.S_ISDIR(opened.st_mode) or not stat.S_ISDIR(visible.st_mode)
+            or (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino)):
+        raise ValueError("Research output destination changed before child open")
+
+
+def _create_bound_run_directory(run_dir: Path, parent_fd: int) -> int:
+    """Claim a new run directory relative to a previously validated parent FD."""
+    name = run_dir.name
+    if not name or name in {".", ".."} or Path(name).name != name:
+        raise ValueError("Bound research run directory name is invalid")
+    validate_research_output_parent(run_dir, parent_fd)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    created = False
+    run_fd = None
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        created = True
+        run_fd = os.open(name, flags, dir_fd=parent_fd)
+        validate_research_output_parent(run_dir, parent_fd)
+        visible = os.stat(run_dir, follow_symlinks=False)
+        opened = os.fstat(run_fd)
+        if (not stat.S_ISDIR(visible.st_mode) or not stat.S_ISDIR(opened.st_mode)
+                or (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino)):
+            raise ValueError("Research run directory changed before child open")
+        return run_fd
+    except BaseException:
+        if run_fd is not None:
+            os.close(run_fd)
+        if created:
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        raise
+
+
 def _exclusive_file(path: Path):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    return os.fdopen(fd, "wb")
+
+
+def _exclusive_file_at(directory_fd: int, name: str):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                 dir_fd=directory_fd)
     return os.fdopen(fd, "wb")
 
 
@@ -638,6 +732,15 @@ def _write_document(path: Path, value: dict) -> None:
     _sync_directory(path.parent)
 
 
+def _write_document_at(directory_fd: int, name: str, value: dict) -> None:
+    data = canonical_bytes(value) + b"\n"
+    if len(data) > MAX_RECORD_BYTES:
+        raise ValueError("Evidence document exceeds V1 size limit")
+    with _exclusive_file_at(directory_fd, name) as stream:
+        _write_durable(stream, data)
+    os.fsync(directory_fd)
+
+
 class ResearchLog:
     """One exclusive run directory; thread-serialized, never reopened or resumed.
 
@@ -654,6 +757,9 @@ class ResearchLog:
                  timing_thread_clock: Callable[[], int] | None = None):
         self.run_dir = Path(run_dir)
         environment = dict(os.environ if environ is None else environ)
+        parent_fd_value = environment.pop(RESEARCH_ROOT_FD_ENV, None)
+        if environ is None:
+            os.environ.pop(RESEARCH_ROOT_FD_ENV, None)
         self._redactor = Redactor(environment)
         self._monotonic_ns = time.monotonic_ns if monotonic_ns is None else monotonic_ns
         self._utc_now = (lambda: datetime.now(timezone.utc)) if utc_now is None else utc_now
@@ -665,6 +771,7 @@ class ResearchLog:
         self._closed = False
         self._finished = False
         self._stream = None
+        self._directory_fd = None
         self.run_id = str(uuid.uuid4())
         # Capture before creating artifacts, so our own files do not dirty provenance.
         manifest = {
@@ -687,18 +794,40 @@ class ResearchLog:
         self._startup_timing_start = None
         self._manifest_hash = digest(manifest)
         self._previous_hash = self._manifest_hash
-        _make_parents(self.run_dir.parent)
-        # mkdir is the single-writer claim; even an existing empty directory is refused.
-        self.run_dir.mkdir(mode=0o700)
+        parent_fd = None
         try:
-            _sync_directory(self.run_dir.parent)
-            _write_document(self.run_dir / "manifest.json", manifest)
-            self._stream = _exclusive_file(self.run_dir / "events.jsonl")
-            _sync_directory(self.run_dir)
+            if parent_fd_value is not None:
+                if (type(parent_fd_value) is not str
+                        or not re.fullmatch(r"[0-9]{1,9}", parent_fd_value)):
+                    raise ValueError("Supervised research output binding is malformed")
+                if os.name == "nt":
+                    raise ValueError("Supervised research output binding requires POSIX directory handles")
+                parent_fd = int(parent_fd_value)
+                try:
+                    parent_stat = os.fstat(parent_fd)
+                except OSError as error:
+                    raise ValueError("Supervised research output binding is unavailable") from error
+                if not stat.S_ISDIR(parent_stat.st_mode):
+                    raise ValueError("Supervised research output binding is not a directory")
+                self._directory_fd = _create_bound_run_directory(self.run_dir, parent_fd)
+                _write_document_at(self._directory_fd, "manifest.json", manifest)
+                self._stream = _exclusive_file_at(self._directory_fd, "events.jsonl")
+                os.fsync(self._directory_fd)
+            else:
+                _make_parents(self.run_dir.parent)
+                # mkdir is the single-writer claim; even an existing empty directory is refused.
+                self.run_dir.mkdir(mode=0o700)
+                _sync_directory(self.run_dir.parent)
+                _write_document(self.run_dir / "manifest.json", manifest)
+                self._stream = _exclusive_file(self.run_dir / "events.jsonl")
+                _sync_directory(self.run_dir)
             self._append("run_started", {"manifest_hash": self._manifest_hash})
         except BaseException:
             self.close()
             raise
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     @property
     def configuration(self) -> RunConfiguration:
@@ -789,11 +918,15 @@ class ResearchLog:
             self._append("run_finished", {"outcome": outcome, "error_type": error_type})
             self._finished = True
             try:
-                _write_document(self.run_dir / "integrity.json", {
+                integrity = {
                     "schema": INTEGRITY_SCHEMA, "schema_version": 1, "run_id": self.run_id,
                     "manifest_hash": self._manifest_hash, "event_count": self._sequence,
                     "final_event_hash": self._previous_hash,
-                })
+                }
+                if self._directory_fd is None:
+                    _write_document(self.run_dir / "integrity.json", integrity)
+                else:
+                    _write_document_at(self._directory_fd, "integrity.json", integrity)
             except BaseException:
                 self._failed = True
                 raise
@@ -806,6 +939,9 @@ class ResearchLog:
             if self._stream is not None:
                 self._stream.close()
                 self._stream = None
+            if self._directory_fd is not None:
+                os.close(self._directory_fd)
+                self._directory_fd = None
 
     def __enter__(self) -> ResearchLog:
         return self
