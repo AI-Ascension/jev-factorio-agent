@@ -27,13 +27,44 @@ with reason `tracked craft is advancing`. It preserves the separate completed
 useful-action timestamp and age. A first observation, replacement receipt,
 repeated count or rewritten heartbeat cannot refresh the craft's progress time.
 If counts stop advancing for the stall interval, the warning returns. Regressed,
-inconsistent or expired craft evidence is unknown; controller blocks, uncertain
-actions, stopped processes and completion retain precedence. Monitoring never
+inconsistent or expired craft evidence is unknown during running work; uncertain
+actions, unrelated controller holds, stopped processes and completion retain precedence. Monitoring never
 unlocks craft outputs or grants a gameplay retry.
 
+When the foreground is waiting specifically for `low choice confidence` or
+`Candidate evidence insufficient`, a qualifying advancing craft is displayed as
+`crafting`, with its batch counter and foreground wait reason. The monitor keeps
+the original blocked-episode timestamp and completed-action age, and reports
+`foreground_status=blocked`; it does not change the controller. Once the craft
+disappears, expires, or stops advancing for the stall interval, the ordinary
+blocked warning returns. A first craft observation cannot suppress that warning.
+
+A probe can also supply `native_research` from `research_sample()`. Read a bounded
+tail of the pinned current execution's research log and pair an `observation`
+with its accepted `observation_validated` record by observation ID. The helper
+checks campaign/execution identity, native world, matching ticks, unpaused runtime
+and timestamps no older than 30 seconds. Never substitute model-request facts or
+an observation that has not passed validation. Omit absent or stale observations;
+malformed or mismatched pairs must fail the probe. Field projections are allowed
+from the trusted local log reader; this helper does not authenticate arbitrary
+external event records or independently query the game.
+
+Two samples of the same technology and force must increase both the research
+fraction and native observation tick before research counts as advancing work.
+A changed technology starts a new baseline; repeated values or a fresh heartbeat
+cannot refresh progress. During either known foreground policy wait, the monitor
+then displays `researching`, technology, percentage and the unchanged wait reason.
+It preserves the blocked episode and completed-action age. A frozen counter,
+missing observation or stopped research restores the ordinary warning. Native
+uncertainty, unrelated holds, process stops and completion still take priority.
+This evidence grants no gameplay retry or research-completion credit.
+An observer gap as long as the stall interval resets the craft/research baseline:
+a larger counter after that gap cannot prove that the work happened recently.
+The original foreground-wait and completed-action timestamps are retained.
+
 By default, sample every 15 seconds, label heartbeats older than 30 seconds
-unknown, and flag 120 seconds without verified useful progress. Policy blocks
-and uncertain actions are visible immediately. Pending native work remains
+unknown, and flag 120 seconds without verified useful progress. Policy waits
+remain visible alongside active crafting; uncertain actions are visible immediately. Pending native work remains
 explicit; a no-progress label never licenses replay. Known completion and a
 service-owner stop are reported without an automatic recovery request.
 
@@ -74,3 +105,18 @@ valid long craft. The regression case retains those observed counters and
 checks that advancing work avoids that warning while a frozen counter still
 expires after 120 seconds. This corrects a display false alarm; it does not
 resolve JEV decision holds or establish multi-day reliability.
+
+On October 6, the monitor reported a foreground low-confidence block while the
+native automation-science craft `1779cc5ea58c4085a53769a0e0635fdd` advanced
+from 16 to 18 of 20 batches. The foreground decision had not stopped the admitted
+craft. The regression retains those counters and checks the combined display,
+preserved wait duration across observer restarts, return to a blocked warning
+when progress expires, and unchanged priority for native faults and stops.
+
+Later that night, Automation 2 research advanced from 21.2111% at tick 13330812
+to 38.3139% at tick 13336969 while the foreground intermittently declined the
+passive wait choice. The monitor previously treated those policy waits as a
+stopped run despite lab progress. The retained fixture contains field projections
+of both accepted native observation pairs, explicitly distinguished from complete
+hash-verifiable event records. Tests cover increasing/frozen/regressed counters,
+pairing, freshness, identity, restart preservation and fault precedence.

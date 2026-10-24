@@ -180,3 +180,164 @@ def test_background_projection_binds_current_checkpoint_job_and_attempt():
     with pytest.raises(ValueError, match='unbound'):
         background_sample({**checkpoint, 'session_id': 'other'})
     assert background_sample({'background_job': None}) is None
+
+
+@pytest.mark.parametrize('reason', ['low choice confidence', 'Candidate evidence insufficient'])
+def test_native_craft_counters_distinguish_foreground_policy_wait(reason):
+    # Observed V27 receipt/counters at 02:25:45 and 02:26:00 UTC. Other sample
+    # envelope fields below are test inputs, not a second native observation.
+    recorded = dict(receipt='1779cc5ea58c4085a53769a0e0635fdd', requested=20,
+        finished=16, started_tick=13092548, last_progress_tick=13097366,
+        deadline_tick=13104548, observed_tick=13097376)
+    waiting = sample(at=1791253545, last_progress_at=1791253545,
+        checkpoint_status='blocked', owner_phase='blocked', reason=reason,
+        pending=True, background_craft=recorded)
+    first = classify(waiting, {}, 1791253545, 'campaign')
+    assert first['status'] == 'blocked'  # First sample alone is not movement.
+    advanced = {**recorded, 'finished': 18, 'last_progress_tick': 13097968,
+                'observed_tick': 13097995}
+    second = classify({**waiting, 'at': 1791253560, 'background_craft': advanced},
+                      first, 1791253560, 'campaign')
+    assert second['status'] == 'crafting' and not second['attention']
+    assert second['foreground_status'] == 'blocked' and second['foreground_reason'] == reason
+    assert second['blocked_age_seconds'] == second['progress_age_seconds'] == 15
+    assert second['last_progress_at'] == first['last_progress_at']
+    assert second['automatic_recovery_allowed'] is False
+    assert banner(second) == f'JEV crafting: 18/20 batches | Foreground waiting: {reason}'
+    # Observer restart, unchanged counters and a fresh heartbeat do not extend
+    # the craft-progress window or erase the original foreground wait time.
+    stale = classify({**waiting, 'at': 1791253680, 'background_craft': advanced},
+                     json.loads(json.dumps(second)), 1791253680, 'campaign')
+    assert stale['status'] == 'blocked' and stale['attention']
+    assert stale['blocked_age_seconds'] == 135
+    finished = classify({**waiting, 'at': 1791253561, 'background_craft': None},
+                        second, 1791253561, 'campaign')
+    assert finished['status'] == 'blocked' and finished['attention']
+    assert finished['blocked_age_seconds'] == 16
+
+
+@pytest.mark.parametrize('change,expected', [
+    ({'checkpoint_status': 'uncertain'}, 'uncertain'),
+    ({'reason': 'native reconciliation required'}, 'blocked'),
+    ({'owner_alive': False}, 'stopped'), ({'child_alive': False}, 'stopped'),
+    ({'owner_phase': 'stopped_by_service_owner'}, 'stopped'),
+    ({'checkpoint_status': 'completed'}, 'completed'),
+])
+def test_crafting_label_never_overrides_fault_stop_or_completion(change, expected):
+    waiting = sample(checkpoint_status='blocked', reason='low choice confidence', background_craft=craft())
+    first = classify(waiting, {}, 1000, 'campaign')
+    advanced = {**craft(), 'finished': 9, 'last_progress_tick': 10928000, 'observed_tick': 10928001}
+    second = classify({**waiting, 'at': 1001, 'background_craft': advanced, **change},
+                      first, 1001, 'campaign')
+    assert second['status'] == expected
+    assert not second['automatic_recovery_allowed']
+
+
+def native_research_pair(index=0):
+    from datetime import datetime
+    pair = json.loads((Path(__file__).parent / 'fixtures/native-v27-research-progress.json').read_text())['pairs'][index]
+    observation, validation = pair['observation'], pair['observation_validated']
+    payload = observation['payload']
+    now = datetime.fromisoformat(validation['time']['utc'].replace('Z', '+00:00')).timestamp()
+    args = dict(session_id=payload['session_id'], checkpoint_tick=payload['factorio_tick'],
+                execution_id=payload['supervisor_provenance']['execution_id'], now=now)
+    return observation, validation, args
+
+
+@pytest.mark.parametrize('reason', ['low choice confidence', 'Candidate evidence insufficient'])
+def test_native_research_progress_preserves_foreground_wait_and_expires(reason):
+    from jev_factorio.progress_watch import research_sample
+    states = []
+    for index in (0, 1):
+        observation, validation, args = native_research_pair(index)
+        research = research_sample(observation, validation, **args)
+        # Heartbeat and completed-action fields are test inputs. Research and
+        # observation pairing/timestamps come from the retained native records.
+        current = sample(session_id=args['session_id'], at=args['now'],
+                         last_progress_at=args['now']-200, checkpoint_status='blocked',
+                         reason=reason, native_research=research)
+        states.append(classify(current, states[-1] if states else {}, args['now'], args['session_id']))
+    first, second = states
+    assert first['status'] == 'blocked'
+    assert second['status'] == 'researching' and not second['attention']
+    assert second['foreground_status'] == 'blocked' and second['foreground_reason'] == reason
+    assert second['last_progress_at'] == first['last_progress_at']
+    assert second['blocked_since'] == first['blocked_since']
+    assert 'automation-2 38.3%' in banner(second)
+    assert not second['automatic_recovery_allowed']
+    later = args['now']+120
+    stale = classify({**current, 'at': later}, json.loads(json.dumps(second)), later, args['session_id'])
+    assert stale['status'] == 'blocked' and stale['attention']
+    assert stale['blocked_since'] == first['blocked_since']
+    stopped_research = classify({**current, 'native_research': None}, second, args['now'], args['session_id'])
+    assert stopped_research['status'] == 'blocked'
+    replaced = classify({**current, 'native_research': {**research, 'technology': 'other'}}, second, args['now'], args['session_id'])
+    assert replaced['status'] == 'blocked'
+
+
+@pytest.mark.parametrize('fault', ['validation', 'observation_id', 'session', 'execution',
+                                  'world', 'tick', 'future_checkpoint', 'stale', 'future', 'paused'])
+def test_research_projection_rejects_unaccepted_mismatched_or_stale_records(fault):
+    from jev_factorio.progress_watch import research_sample
+    observation, validation, args = native_research_pair()
+    if fault == 'validation': validation['payload']['accepted'] = False
+    elif fault == 'observation_id': validation['payload']['observation_id'] = 'other'
+    elif fault == 'session': validation['payload']['session_id'] = 'other'
+    elif fault == 'execution': validation['payload']['supervisor_provenance']['execution_id'] = 'other'
+    elif fault == 'world': observation['payload']['snapshot']['world_kind'] = 'mock'
+    elif fault == 'tick': validation['payload']['factorio_tick'] -= 1
+    elif fault == 'future_checkpoint': args['checkpoint_tick'] -= 1
+    elif fault == 'stale': args['now'] += 31
+    elif fault == 'future': args['now'] -= 3
+    elif fault == 'paused': observation['payload']['snapshot']['factory']['acceptance_runtime']['tick_paused'] = True
+    with pytest.raises(ValueError): research_sample(observation, validation, **args)
+
+
+@pytest.mark.parametrize('change,expected', [
+    ({'checkpoint_status': 'uncertain'}, 'uncertain'),
+    ({'reason': 'native reconciliation required'}, 'blocked'),
+    ({'owner_alive': False}, 'stopped'), ({'child_alive': False}, 'stopped'),
+    ({'owner_phase': 'stopped_by_service_owner'}, 'stopped'),
+    ({'checkpoint_status': 'completed'}, 'completed'),
+    ({'checkpoint_status': 'running'}, 'progressing'),
+])
+def test_research_progress_never_overrides_fault_stop_or_completion(change, expected):
+    research = dict(technology='automation-2', force_index=1, progress=.2, observed_tick=100)
+    current = sample(checkpoint_status='blocked', reason='low choice confidence', native_research=research)
+    first = classify(current, {}, 1000, 'campaign')
+    second = classify({**current, 'at': 1001, 'native_research': {**research, 'progress': .3, 'observed_tick': 101}, **change}, first, 1001, 'campaign')
+    assert second['status'] == expected
+    assert not second['automatic_recovery_allowed']
+
+
+@pytest.mark.parametrize('change', [dict(progress=.1, observed_tick=101), dict(progress=.3),
+                                  dict(progress=float('nan')), dict(observed_tick=99)])
+def test_invalid_research_counters_never_claim_progress(change):
+    research = dict(technology='automation-2', force_index=1, progress=.2, observed_tick=100)
+    first = classify(sample(native_research=research), {}, 1000, 'campaign')
+    second = classify(sample(at=1001, native_research={**research, **change}), first, 1001, 'campaign')
+    assert second['status'] == 'unknown' and second['attention']
+
+
+def test_research_world_tick_alone_does_not_refresh_progress():
+    research = dict(technology='automation-2', force_index=1, progress=.2, observed_tick=100)
+    first = classify(sample(native_research=research), {}, 1000, 'campaign')
+    second = classify(sample(at=1100, native_research={**research, 'observed_tick': 999}), first, 1100, 'campaign')
+    assert second['status'] == 'no_progress' and second['research_progress']['advanced_at'] is None
+
+
+@pytest.mark.parametrize('kind', ['native_research', 'background_craft'])
+def test_long_observer_gap_requires_new_baseline_before_progress_credit(kind):
+    if kind == 'native_research':
+        before = dict(technology='automation-2', force_index=1, progress=.2, observed_tick=100)
+        after = {**before, 'progress': .3, 'observed_tick': 101}
+    else:
+        before = craft()
+        after = {**before, 'finished': 9, 'last_progress_tick': 10928000, 'observed_tick': 10928001}
+    current = sample(checkpoint_status='blocked', reason='low choice confidence', **{kind: before})
+    first = classify(current, {}, 1000, 'campaign')
+    second = classify({**current, 'at': 1121, kind: after}, json.loads(json.dumps(first)), 1121, 'campaign')
+    assert second['status'] == 'blocked' and second['attention']
+    assert second['blocked_since'] == 1000
+    key = 'research_progress' if kind == 'native_research' else 'craft_progress'
+    assert second[key]['advanced_at'] is None
