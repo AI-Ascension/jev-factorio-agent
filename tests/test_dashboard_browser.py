@@ -8,7 +8,7 @@ import time
 import pytest
 
 playwright = pytest.importorskip("playwright.sync_api", reason="Install .[dashboard-test] for browser tests")
-from jev_factorio.dashboard import DashboardServer, EventWriter, Monitor
+from jev_factorio.dashboard import DashboardServer, EventWriter, Monitor, project_record
 
 
 @pytest.fixture
@@ -734,6 +734,43 @@ def test_mission_stale_snapshot_does_not_rejuvenate_on_model_event(live):
         };
     }''')
     assert rendered == {'freshness': 'STALE / DISCONNECTED', 'historical': True}
+    assert not errors
+
+
+def test_explicit_empty_after_state_clears_launch_and_current_research_display(live):
+    from test_dashboard_mission import mission_state
+    from test_research_catalog import DATA_20, raw_catalog
+    from jev_factorio import research_catalog
+
+    page, writer, url, errors = live
+    catalog = raw_catalog(DATA_20, researched=["electronics", "automation-science-pack"])
+    catalog["state"].update({"tick": 5, "current": "automation", "progress": 0.5})
+    research_catalog.write(writer.path.with_name(research_catalog.FILENAME), catalog)
+    page.goto(url)
+    playwright.expect(page.locator("#research-current")).to_have_text("Automation")
+    complete = mission_state()
+    complete["researched"] = ["electronics", "automation-science-pack"]
+    writer.emit("decision_recorded", 7, record=project_record({
+        "after_state": complete, "action": "observe",
+    }))
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch prerequisites observed")
+    playwright.expect(page.locator("#mission-production")).to_contain_text("rocket-silo")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("LATEST CAPTURED OBSERVATION")
+    playwright.expect(page.locator("#research-current")).to_have_text("Rocket silo")
+
+    writer.emit("decision_recorded", 7, record=project_record({
+        "state": complete, "after_state": {}, "action": "observe",
+    }))
+    playwright.expect(page.locator("#launch-headline")).to_have_text("Launch evidence unavailable")
+    playwright.expect(page.locator("#mission-production")).not_to_contain_text("rocket-silo")
+    playwright.expect(page.locator("#mission-freshness")).to_have_text("STALE / DISCONNECTED")
+    playwright.expect(page.locator("#research-strip")).to_be_hidden()
+    response = page.request.get(f"{url}/api/snapshot")
+    assert response.ok
+    research = response.json()["view"]["research"]
+    assert research["status"] == "observation incomplete"
+    assert research["current"] is None
+    assert research["tiers"]
     assert not errors
 
 
