@@ -79,6 +79,48 @@ local function cargo_item(inv)
     end
     return item
 end
+local function exact_fields(value, fields)
+    if type(value)~="table" then return false end
+    local expected,count={},0
+    for _,field in ipairs(fields) do expected[field]=true end
+    for field in pairs(value) do
+        if type(field)~="string" or not expected[field] then return false end
+        count=count+1
+    end
+    return count==#fields
+end
+local function integer(value)
+    return type(value)=="number" and value>=0 and value==math.floor(value)
+end
+local function load_reconciled(silo,rocket,item)
+    if type(r.attempts)~="table" or type(r.receipts)~="table" then return false end
+    local attempt=r.attempts.load
+    local matching,load_count=nil,0
+    for receipt_id,receipt in pairs(r.receipts) do
+        if type(receipt)=="table" and receipt.kind=="load" then
+            load_count=load_count+1
+            if type(attempt)=="table" and receipt_id==attempt.receipt then matching=receipt end
+        end
+    end
+    if attempt==nil then return load_count==0 end
+    if not exact_fields(attempt,{"receipt","silo_unit","rocket_unit","item","tick"})
+        or type(attempt.receipt)~="string" or #attempt.receipt==0 or #attempt.receipt>128
+        or not integer(attempt.silo_unit) or attempt.silo_unit<1
+        or not integer(attempt.rocket_unit) or attempt.rocket_unit<1
+        or type(attempt.item)~="string" or (attempt.item~="raw-fish" and attempt.item~="satellite")
+        or not integer(attempt.tick) then return false end
+    if load_count~=1 or not matching
+        or not exact_fields(matching,{"kind","session_id","actor_unit","tick","item",
+            "quantity","silo_unit","rocket_unit"}) then return false end
+    return matching.kind=="load" and matching.session_id==r.session_id
+        and matching.actor_unit==r.actor_unit and integer(matching.tick)
+        and matching.tick==attempt.tick and matching.tick<=game.tick
+        and matching.item==attempt.item and matching.item==item and matching.quantity==1
+        and integer(matching.silo_unit) and matching.silo_unit==attempt.silo_unit
+        and integer(matching.rocket_unit) and matching.rocket_unit==attempt.rocket_unit
+        and silo and silo.unit_number==attempt.silo_unit
+        and rocket and rocket.unit_number==attempt.rocket_unit
+end
 local function base_receipt(kind)
     return {kind=kind,session_id=r.session_id,actor_unit=r.actor_unit,tick=game.tick}
 end
@@ -236,6 +278,7 @@ r.launch=function(role)
     assert(silo.send_to_orbit_automatically==false and silo.rocket_silo_status==defines.rocket_silo_status.rocket_ready,
         "Rocket launch not ready for manual request")
     assert(player.can_reach_entity(silo), "Rocket outside native reach")
+    assert(load_reconciled(silo,rocket,item), "Paid payload load is unresolved; retain its original receipt")
     r.attempts.launch={silo_unit=silo.unit_number,rocket_unit=rocket.unit_number,tick=game.tick}
     r.silo_unit=silo.unit_number
     old_launch(role) -- Engine return remains final authority; no invented can-launch API.
