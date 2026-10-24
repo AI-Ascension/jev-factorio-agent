@@ -6,10 +6,15 @@ passing the offline tests.
 """
 from __future__ import annotations
 
-import json
+import asyncio
+import base64
+import concurrent.futures
 import hashlib
+import json
 import math
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from uuid import uuid4
 from dataclasses import asdict, replace
@@ -33,6 +38,156 @@ from .telemetry import DISPATCH_STAGES, error_code, fingerprint, make_attempt, p
 from .wait_record_codec import Encoder as WaitRecordEncoder, encode_line as encode_wait_line
 
 
+MAX_ASYNC_CONTROLLER_WORKERS = 4
+MAX_ASYNC_ACTOR_SLOTS = 128
+_ASYNC_ACTOR_GUARD = threading.Lock()
+_ASYNC_ACTOR_SLOTS: dict[tuple[str, int], dict] = {}
+_ASYNC_WORKER_SLOTS = threading.BoundedSemaphore(MAX_ASYNC_CONTROLLER_WORKERS)
+_ASYNC_EXECUTOR = ThreadPoolExecutor(
+    max_workers=MAX_ASYNC_CONTROLLER_WORKERS,
+    thread_name_prefix="jev-async-controller",
+)
+_ASYNC_WORKER_LOCAL = threading.local()
+
+
+class AsyncControllerBusy(RuntimeError):
+    """The bounded async controller or its stable actor is already owned."""
+
+
+class _AsyncStepCancelled(Exception):
+    """Internal stop signal; public cancellation is raised after worker exit."""
+
+
+def _claim_async_actor(key: tuple[str, int]):
+    with _ASYNC_ACTOR_GUARD:
+        slot = _ASYNC_ACTOR_SLOTS.get(key)
+        if slot is None:
+            if len(_ASYNC_ACTOR_SLOTS) >= MAX_ASYNC_ACTOR_SLOTS:
+                raise AsyncControllerBusy("Async actor ownership table is full")
+            slot = {"lock": threading.Lock(), "users": 0}
+            _ASYNC_ACTOR_SLOTS[key] = slot
+        slot["users"] += 1
+        if not slot["lock"].acquire(blocking=False):
+            slot["users"] -= 1
+            if slot["users"] == 0:
+                _ASYNC_ACTOR_SLOTS.pop(key, None)
+            raise AsyncControllerBusy("This Factorio session actor already has a controller step")
+        return key, slot
+
+
+def _release_async_actor(claim) -> None:
+    key, slot = claim
+    with _ASYNC_ACTOR_GUARD:
+        slot["lock"].release()
+        slot["users"] -= 1
+        if slot["users"] == 0:
+            _ASYNC_ACTOR_SLOTS.pop(key, None)
+
+
+class _AsyncProviderBridge:
+    """Run the synchronous reducer's provider call on its owning event loop."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, cancelled: threading.Event):
+        self.loop, self.cancelled = loop, cancelled
+        self._task = None
+        self._task_lock = threading.Lock()
+
+    async def _run(self, awaitable):
+        return await awaitable
+
+    def call(self, awaitable_factory):
+        if self.cancelled.is_set():
+            raise _AsyncStepCancelled
+        complete = threading.Event()
+        result = {}
+
+        def start():
+            if self.cancelled.is_set():
+                result["error"] = _AsyncStepCancelled()
+                complete.set()
+                return
+            try:
+                task = self.loop.create_task(self._run(awaitable_factory()))
+            except BaseException as error:
+                result["error"] = error
+                complete.set()
+                return
+            with self._task_lock:
+                self._task = task
+
+            def finished(done):
+                try:
+                    result["value"] = done.result()
+                except BaseException as error:
+                    result["error"] = error
+                finally:
+                    with self._task_lock:
+                        if self._task is done:
+                            self._task = None
+                    complete.set()
+
+            task.add_done_callback(finished)
+
+        self.loop.call_soon_threadsafe(start)
+        cancel_sent = False
+        while not complete.wait(0.025):
+            if self.cancelled.is_set() and not cancel_sent:
+                with self._task_lock:
+                    task = self._task
+                if task is not None:
+                    self.loop.call_soon_threadsafe(task.cancel)
+                    cancel_sent = True
+        if "error" in result:
+            if self.cancelled.is_set() and isinstance(result["error"], asyncio.CancelledError):
+                raise _AsyncStepCancelled from None
+            raise result["error"]
+        return result["value"]
+
+
+class _AsyncDecisionAdapter:
+    """Synchronous reducer facade backed by one exact asynchronous request."""
+
+    def __init__(self, controller):
+        self.controller = controller
+        self.last_model = None
+        self.last_usage = None
+
+    @property
+    def model(self):
+        return getattr(self.controller._async_provider_client, "model", None)
+
+    @property
+    def is_mock(self):
+        return getattr(self.controller._async_provider_client, "is_mock", False)
+
+    @property
+    def answer_quantum(self):
+        return getattr(self.controller._async_provider_client, "answer_quantum", 0)
+
+    def evaluate(self, state: dict, questions: dict) -> dict:
+        result = self.controller._async_evaluate_request(state, questions)
+        self.last_model = result.get("resolved_model")
+        self.last_usage = result.get("usage")
+        self.controller._async_last_result = result
+        return _json_mutable(result["answers"])
+
+
+def _serialized_async_actor(method):
+    """Serialize explicit async-mode sync entrypoints by stable actor identity."""
+    from functools import wraps
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if not getattr(self, "async_decisions", False):
+            return method(self, *args, **kwargs)
+        scope = getattr(_ASYNC_WORKER_LOCAL, "scope", None)
+        if scope is not None and scope.get("owner") is self:
+            return method(self, *args, **kwargs)
+        raise RuntimeError("Async-decision controllers must be stepped with await step_async()")
+
+    return wrapper
+
+
 def _json_safe(value):
     """Keep malformed numeric answers auditable without emitting invalid JSON."""
     if isinstance(value, float) and not math.isfinite(value):
@@ -41,6 +196,17 @@ def _json_safe(value):
         return {key: _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
+    return value
+
+
+def _json_mutable(value):
+    """Detach immutable provider JSON projections for the existing reducer."""
+    from collections.abc import Mapping
+
+    if isinstance(value, Mapping):
+        return {key: _json_mutable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_mutable(item) for item in value]
     return value
 
 
@@ -59,7 +225,9 @@ class HierarchicalLoop(AgentLoop):
                  blocked_source_revision: str | None = None,
                  persist_recoverable_blocks: bool = False,
                  initialize_persistent_campaign: bool = False,
-                 persistent_idle_observations: int = DEFAULT_IDLE_OBSERVATIONS):
+                 persistent_idle_observations: int = DEFAULT_IDLE_OBSERVATIONS,
+                 async_decisions: bool = False,
+                 async_decision_timeout: float = 30.0):
         if factory_scheduling not in {"serial", "ready-work"}:
             raise ValueError("Unknown factory scheduling policy")
         self.factory_scheduling = factory_scheduling
@@ -68,6 +236,22 @@ class HierarchicalLoop(AgentLoop):
             raise ValueError("Unknown campaign policy")
         if policy != "deterministic" and jev is None:
             raise ValueError("Supply an explicit Jev client; mock use must be intentional")
+        if type(async_decisions) is not bool:
+            raise ValueError("Async decision mode must be explicitly enabled with a boolean")
+        if (not isinstance(async_decision_timeout, (int, float))
+                or isinstance(async_decision_timeout, bool)
+                or not math.isfinite(async_decision_timeout)
+                or not 0 < async_decision_timeout <= 300):
+            raise ValueError("Async decision deadline must be in (0, 300] seconds")
+        if async_decisions:
+            import inspect
+
+            if (policy == "deterministic" or checkpoint is None
+                    or not callable(getattr(jev, "prepare_decision_payload", None))
+                    or not callable(getattr(jev, "decision_provider_id", None))
+                    or not inspect.iscoroutinefunction(getattr(jev, "evaluate", None))):
+                raise ValueError(
+                    "Async decisions require a checkpoint and an explicit async Jev provider")
         if not math.isfinite(confidence_floor) or not 0 <= confidence_floor <= 1:
             raise ValueError("Confidence floor must be in [0, 1]")
         if not math.isfinite(tick_seconds) or tick_seconds < 0:
@@ -78,6 +262,19 @@ class HierarchicalLoop(AgentLoop):
         self.provenance = gameplay_context()
         self.order = goal_order(target)
         self.backend, self.jev, self.policy = backend, jev, policy
+        self.async_decisions = async_decisions
+        self.async_decision_timeout = float(async_decision_timeout)
+        self._async_provider_client = None
+        self._async_archive = None
+        self._async_wal = None
+        self._async_runtime_identity = None
+        self._async_loop = None
+        self._async_execution = None
+        self._async_selection_scope = None
+        self._async_active_record = None
+        self._async_active_lease = None
+        self._async_last_result = None
+        self._async_last_outcome = None
         self.target, self.confidence_floor = target, confidence_floor
         self.tick_seconds = tick_seconds
         self.log_file = Path(log_file) if log_file else None
@@ -173,7 +370,19 @@ class HierarchicalLoop(AgentLoop):
         self._safety = RuntimeSafety(self.checkpoint, outputs=(
             self.log_file.parent if self.log_file else None,
             getattr(research_log, "run_dir", None))) if self.checkpoint else None
-        if jev is not None and getattr(jev, "uses_http_provider", False):
+        if async_decisions:
+            from .async_decision_archive import AsyncDecisionArchive
+            from .provider_decision_wal import ProviderDecisionWAL
+
+            self._async_provider_client = jev
+            self.jev = ProviderCircuit(jev, self._safety.directory / "provider.json")
+            wal_path = self._safety.directory / "provider-decisions.json"
+            self._async_archive = AsyncDecisionArchive(
+                self._safety.directory / "decision-archives")
+            self._async_wal = (
+                ProviderDecisionWAL.initialize(wal_path)
+                if not resume_controller else ProviderDecisionWAL(wal_path))
+        elif jev is not None and getattr(jev, "uses_http_provider", False):
             self.jev = ProviderCircuit(jev, self._safety.directory / "provider.json"
                                       if self._safety else None)
             jev = self.jev
@@ -185,6 +394,8 @@ class HierarchicalLoop(AgentLoop):
         self._fuel_history = FuelHistory()
         self.catalog = None
         self._trace = CausalTrace(research_log, "hierarchical", jev, provenance=self.provenance)
+        self._async_decision_adapter = (
+            _AsyncDecisionAdapter(self) if self.async_decisions else None)
         self._trace.metrics = self._performance if self.factory_scheduling == "ready-work" else None
         self._trace.admission_check = (
             lambda: self._safety.before_dispatch(self.memory.session_id)) if self._safety else None
@@ -192,6 +403,885 @@ class HierarchicalLoop(AgentLoop):
                 and hasattr(backend, "enable_factory"):
             self.catalog = backend.enable_factory()
             self.max_pending_polls = max(self.max_pending_polls, 1800)
+
+    async def step_async(self) -> dict:
+        """Run one explicitly enabled durable async-provider controller step.
+
+        The synchronous reducer and backend remain in a bounded worker. The
+        provider coroutine stays on this event loop; cancellation is signalled
+        to that request and this method waits for the worker's terminal state
+        before releasing stable actor ownership.
+        """
+        if not self.async_decisions:
+            raise RuntimeError("Enable async_decisions explicitly before calling step_async")
+        loop = asyncio.get_running_loop()
+        if self._async_loop is None:
+            self._async_loop = loop
+        elif self._async_loop is not loop:
+            raise RuntimeError("An async controller instance is bound to one event loop")
+        key = self._async_actor_lock_key()
+        if not _ASYNC_WORKER_SLOTS.acquire(blocking=False):
+            raise AsyncControllerBusy("The bounded async controller worker pool is full")
+        try:
+            claim = _claim_async_actor(key)
+        except BaseException:
+            _ASYNC_WORKER_SLOTS.release()
+            raise
+        cancelled = threading.Event()
+        bridge = _AsyncProviderBridge(loop, cancelled)
+        execution = {"loop": loop, "cancelled": cancelled, "bridge": bridge,
+                     "claim": claim, "worker": None, "dispatch_gate": threading.Lock(),
+                     "dispatch_entered": False}
+        self._async_execution = execution
+        worker = loop.run_in_executor(_ASYNC_EXECUTOR, self._run_async_step_worker, execution)
+        execution["worker"] = worker
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            with execution["dispatch_gate"]:
+                cancelled.set()
+            current = asyncio.current_task()
+            if current is not None and callable(getattr(current, "uncancel", None)):
+                current.uncancel()
+            try:
+                await asyncio.shield(worker)
+            except BaseException:
+                # Cancellation remains the caller-visible outcome; the worker
+                # has nevertheless reached a terminal state before cleanup.
+                pass
+            raise
+        finally:
+            if not worker.done():
+                with execution["dispatch_gate"]:
+                    cancelled.set()
+                current = asyncio.current_task()
+                if current is not None and callable(getattr(current, "uncancel", None)):
+                    current.uncancel()
+                try:
+                    await asyncio.shield(worker)
+                except BaseException:
+                    pass
+            self._async_execution = None
+            _release_async_actor(claim)
+            _ASYNC_WORKER_SLOTS.release()
+
+    def _run_async_step_worker(self, execution: dict):
+        _ASYNC_WORKER_LOCAL.scope = {"owner": self, "execution": execution}
+        try:
+            return self.step()
+        finally:
+            try:
+                del _ASYNC_WORKER_LOCAL.scope
+            except AttributeError:
+                pass
+
+    async def aclose_async_provider(self) -> None:
+        """Close only provider resources owned by this explicitly async client."""
+        if not self.async_decisions:
+            return
+        if self._async_execution is not None:
+            worker = self._async_execution.get("worker")
+            if worker is not None and not worker.done():
+                raise AsyncControllerBusy("Cannot close an async provider during a controller step")
+        loop = asyncio.get_running_loop()
+        if self._async_loop is None:
+            self._async_loop = loop
+        elif self._async_loop is not loop:
+            raise RuntimeError("Async provider resources must close on their owning event loop")
+        close = getattr(self.jev, "aclose", None)
+        if callable(close):
+            await close()
+
+    def _async_execution_context(self) -> dict:
+        scope = getattr(_ASYNC_WORKER_LOCAL, "scope", None)
+        if (scope is None or scope.get("owner") is not self
+                or not isinstance(scope.get("execution"), dict)):
+            raise RuntimeError("Async provider execution is outside step_async()")
+        return scope["execution"]
+
+    def _async_cancel_requested(self) -> bool:
+        return bool(self._async_execution is not None
+                    and self._async_execution["cancelled"].is_set())
+
+    def _async_enter_dispatch(self) -> bool:
+        """Linearize cancellation against the already-checkpointed mutation boundary."""
+        execution = self._async_execution_context()
+        with execution["dispatch_gate"]:
+            if execution["cancelled"].is_set():
+                return False
+            # From this point the worker owns the normal dispatch/verification
+            # path. step_async waits for it to finish before returning cancel.
+            execution["dispatch_entered"] = True
+            return True
+
+    def _async_actor_lock_key(self) -> tuple[str, int]:
+        attachment = getattr(self.backend, "_native_attachment", None)
+        if isinstance(attachment, dict):
+            session_id, actor_unit = attachment.get("session_id"), attachment.get("actor_unit")
+        else:
+            from .backends.mock import MockBackend
+            if isinstance(self.backend, MockBackend):
+                session_id, actor_unit = getattr(self.backend, "session_id", None), 0
+            else:
+                session_id = getattr(self.backend, "session_id", None)
+                actor_unit = getattr(self.backend, "actor_unit", None)
+        if (type(session_id) is not str or not session_id or len(session_id) > 128
+                or type(actor_unit) is not int or actor_unit < 0):
+            raise AsyncControllerBusy(
+                "Async decisions require a stable session and actor identity before worker admission")
+        return session_id, actor_unit
+
+    def _async_observation_identity(self, snapshot: GameSnapshot) -> dict:
+        if snapshot.world_kind == "mock":
+            if snapshot.session_id != getattr(self.backend, "session_id", None):
+                raise ValueError("Mock async observation session identity changed")
+            return {"session_id": snapshot.session_id, "actor_unit": 0,
+                    "surface_index": 0, "force_index": 0}
+        if snapshot.world_kind != "fle":
+            raise ValueError("Async decisions require mock or identified FLE observations")
+        runtime = snapshot.factory.get("acceptance_runtime")
+        fields = ("session_id", "actor_unit", "surface_index", "force_index")
+        if (type(runtime) is not dict
+                or any(name not in runtime for name in fields)
+                or type(runtime.get("session_id")) is not str
+                or runtime.get("session_id") != snapshot.session_id
+                or any(type(runtime.get(name)) is not int or runtime[name] < 1
+                       for name in fields[1:])):
+            raise ValueError("Async FLE observation lacks its exact four-field runtime identity")
+        attachment = getattr(self.backend, "_native_attachment", None)
+        if (type(attachment) is not dict or attachment.get("qualified") is not True
+                or attachment.get("session_id") != runtime["session_id"]
+                or attachment.get("actor_unit") != runtime["actor_unit"]):
+            raise ValueError("Async FLE observation differs from the retained attachment owner")
+        return {name: runtime[name] for name in fields}
+
+    def _validate_async_observation(self, snapshot: GameSnapshot) -> None:
+        if not self.async_decisions:
+            return
+        current = self._async_observation_identity(snapshot)
+        expected = self._async_runtime_identity
+        if expected is None and self.memory is not None and self.memory.async_decision is not None:
+            record = self._async_archive.load(self.memory.async_decision)
+            expected = record["selector"]["runtime_identity"]
+        if expected is not None and current != expected:
+            raise ValueError("Async controller runtime actor identity changed")
+        self._async_runtime_identity = current
+
+    def _async_lease_from_record(self, record: dict):
+        from .async_provider import RequestIdentity
+        from .decision_lease import ProviderDecisionLease
+        from .provider_decision_wal import ProviderDecisionIdentity, canonical_sha256
+
+        identity_data = record["identity"]
+        identity = ProviderDecisionIdentity(**identity_data)
+        request_identity = RequestIdentity(
+            session_id=identity.session_id, actor_id=identity.actor_id,
+            observation_id=identity.observation_id, decision_id=identity.decision_id,
+            request_id=identity.request_id,
+        )
+        provider = record["provider"]
+        wal_request_json = json.dumps(
+            provider["wal_request"], ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":"),
+        )
+        wal_id = hashlib.sha256(
+            str(Path(self._async_wal.path).resolve()).encode("utf-8")).hexdigest()
+        if wal_id != provider["wal_id"]:
+            raise ValueError("Archived async decision belongs to a different WAL path")
+        return ProviderDecisionLease(
+            self._async_wal, identity, request_identity,
+            provider["payload_json"], wal_request_json,
+            canonical_sha256(provider["wal_request"]), provider["payload_sha256"],
+            provider["wal_request"]["health_state_sha256"], wal_id,
+            provider["provider_id"], provider["model_id"],
+            provider["wal_request"]["trace_binding"], self.jev.clock,
+        )
+
+    def _async_prepare_selection(self, *, snapshot: GameSnapshot, source_state: dict,
+                                 state: dict,
+                                 questions: dict, plans: list[Plan],
+                                 offered: list[Plan], selection_batch: dict | None = None,
+                                 persistent_input_sha256: str | None = None,
+                                 source_authorized: bool = False,
+                                 authorization_reason: str | None = None,
+                                 checkpoint_update=None) -> None:
+        if not self.async_decisions:
+            return
+        execution = self._async_execution_context()
+        if execution["cancelled"].is_set():
+            raise _AsyncStepCancelled
+        if self.memory.async_decision is not None:
+            record = self._async_archive.load(self.memory.async_decision)
+            lease = self._async_lease_from_record(record)
+            self._async_active_record, self._async_active_lease = record, lease
+            self._async_selection_scope = {
+                                           "source_state": record["selector"]["source_state"],
+                                           "state": record["selector"]["state"],
+                                           "questions": record["selector"]["questions"],
+                                           "record": record, "lease": lease}
+            return
+        if not isinstance(self.provenance.get("code_revision"), dict):
+            raise ValueError("Async selection requires a source-pinned controller revision")
+        from .async_provider import RequestIdentity
+
+        runtime = self._async_runtime_identity
+        if not isinstance(runtime, dict):
+            raise ValueError("Async selection requires a validated four-field actor identity")
+        if not isinstance(source_state, dict):
+            raise ValueError("Async selection requires the original source state")
+        if (authorization_reason is not None
+                and (type(authorization_reason) is not str or len(authorization_reason) > 4096)):
+            raise ValueError("Async authorization reason exceeds its bounded text contract")
+        actor_bytes = json.dumps(runtime, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":"), allow_nan=False).encode("utf-8")
+        actor_id = "actor:" + hashlib.sha256(actor_bytes).hexdigest()
+        request_id = str(uuid4())
+        identity = RequestIdentity(
+            session_id=snapshot.session_id, actor_id=actor_id,
+            observation_id=self._trace.observation_id or "observation:" + uuid4().hex,
+            decision_id=self._trace.decision_id or "decision:" + uuid4().hex,
+            request_id=request_id,
+        )
+        lease = self.jev.prepare_decision_lease(
+            self._async_wal, state, questions, identity=identity)
+        provider_payload = self._async_provider_client.prepare_decision_payload(
+            state, questions)
+        if provider_payload != lease.payload:
+            raise ValueError("Prepared async provider payload differs from its lease")
+        wire_body = json.dumps(
+            provider_payload, ensure_ascii=False, allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        from .causal_trace import describe_request_order
+
+        plan_rows = [plan.to_dict() for plan in plans]
+        offered_rows = [plan.to_dict() for plan in offered]
+        provider = {
+            "provider_id": lease.provider_id,
+            "model_id": lease.model_id,
+            "payload": provider_payload,
+            "payload_json": lease.request_json,
+            "payload_sha256": lease.request_payload_sha256,
+            "wire_body_base64": base64.b64encode(wire_body).decode("ascii"),
+            "wire_body_sha256": hashlib.sha256(wire_body).hexdigest(),
+            "wal_request": lease.wal_request,
+            "wal_id": lease.wal_id,
+        }
+        archive_id = hashlib.sha256(
+            (request_id + ":" + lease.wal_id + ":" + actor_id).encode("utf-8")).hexdigest()
+        record = {
+            "schema": 1, "archive_id": archive_id, "request_id": request_id,
+            "identity": lease.identity.to_dict(),
+            "selector": {
+                "source_state": source_state,
+                "state": state, "questions": questions,
+                "candidate_plans": plan_rows, "offered_plans": offered_rows,
+                "source_revision": self.provenance["code_revision"],
+                "session_id": snapshot.session_id, "actor_id": actor_id,
+                "runtime_identity": runtime,
+                "observation_id": identity.observation_id,
+                "decision_id": identity.decision_id, "request_id": request_id,
+                "observation_tick": snapshot.tick, "target": self.target,
+                "policy": self.policy, "confidence_floor": self.confidence_floor,
+                "max_request_bytes": self.max_request_bytes,
+                "request_order": describe_request_order(state, questions),
+                "persistent_input_sha256": persistent_input_sha256,
+                "selection_batch": selection_batch,
+                "source_authorized": source_authorized,
+                "source_auth_reason_sha256": (
+                    hashlib.sha256(authorization_reason.encode("utf-8")).hexdigest()
+                    if authorization_reason is not None else None),
+                "frontier_sha256": fingerprint(plan_rows),
+            },
+            "provider": provider,
+        }
+        record = _json_mutable(record)
+        pointer = self._async_archive.store(record)
+        # Archive first, pointer second, WAL reservation and MAY_HAVE_BEEN_SENT
+        # only later in AsyncProviderClient.post_json.
+        if checkpoint_update is not None:
+            checkpoint_update()
+        self.memory.async_decision = pointer
+        self._save()
+        self._async_active_record, self._async_active_lease = record, lease
+        self._async_selection_scope = {"source_state": source_state,
+                                       "state": state, "questions": questions,
+                                       "record": record, "lease": lease}
+
+    @staticmethod
+    def _async_json_equal(left, right) -> bool:
+        try:
+            return json.dumps(left, sort_keys=True, ensure_ascii=False,
+                              separators=(",", ":"), allow_nan=False) == json.dumps(
+                                  right, sort_keys=True, ensure_ascii=False,
+                                  separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    @staticmethod
+    def _async_semantic_selection_sha256(state: dict, plans: list[dict], *,
+                                         session_id: str, source_revision: dict,
+                                         target: str, policy: str,
+                                         confidence_floor: float,
+                                         max_request_bytes: int,
+                                         current_tick: int) -> str:
+        """Fingerprint current decision semantics while normalizing known clocks.
+
+        The existing blocked-decision fingerprint has an intentional Jev-only
+        policy contract. Async selection also supports the hybrid policy, so
+        reuse its source-stable value normalization while binding the actual
+        policy and request budget here.
+        """
+        from .blocked_persistence import _stable
+
+        payload = {
+            "schema": 1, "session_id": session_id,
+            "source_revision": source_revision, "target": target,
+            "policy": policy, "confidence_floor": confidence_floor,
+            "max_request_bytes": max_request_bytes,
+            "state": _stable(deepcopy(state), current_tick=current_tick),
+            "plans": _stable(deepcopy(plans), path=("plans",), current_tick=current_tick),
+        }
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _async_wal_record_sha256(wal_record) -> str | None:
+        if wal_record is None:
+            return None
+        proof = {
+            "identity": wal_record.identity.to_dict(),
+            "request_sha256": wal_record.request_sha256,
+            "phase": wal_record.phase,
+            "state": wal_record.state,
+            "result_sha256": wal_record.result_sha256,
+            "error_category": wal_record.error_category,
+            "event_count": wal_record.event_count,
+            "http_status": wal_record.http_status,
+        }
+        encoded = json.dumps(proof, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _async_settlement_entries(self) -> list[dict]:
+        from .async_decision_archive import MAX_ARCHIVE_RECORDS
+
+        rows = [row for row in self.memory.history
+                if row.get("kind") == "async_decision_settled"]
+        if len(rows) > 1:
+            raise ValueError("Checkpoint contains duplicate async settlement ledgers")
+        if not rows:
+            return []
+        row = rows[0]
+        if (set(row) != {"kind", "schema", "entries", "entries_sha256"}
+                or type(row.get("schema")) is not int or row["schema"] != 1
+                or type(row.get("entries")) is not list
+                or len(row["entries"]) > MAX_ARCHIVE_RECORDS
+                or type(row.get("entries_sha256")) is not str):
+            raise ValueError("Checkpoint async settlement ledger is malformed")
+        from .async_decision_archive import AsyncDecisionArchive
+
+        entries = [AsyncDecisionArchive.validate_settlement_entry(entry)
+                   for entry in row["entries"]]
+        if len({entry["archive_id"] for entry in entries}) != len(entries):
+            raise ValueError("Checkpoint async settlement ledger has duplicate archives")
+        encoded = json.dumps(entries, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if hashlib.sha256(encoded).hexdigest() != row["entries_sha256"]:
+            raise ValueError("Checkpoint async settlement ledger digest mismatch")
+        return entries
+
+    def _async_record_settlement(self, record: dict, entry: dict) -> None:
+        from .async_decision_archive import MAX_ARCHIVE_RECORDS, AsyncDecisionArchive
+
+        entry = AsyncDecisionArchive.validate_settlement_entry(entry)
+        entries = self._async_settlement_entries()
+        prior = next((item for item in entries
+                      if item["archive_id"] == entry["archive_id"]), None)
+        if prior is not None:
+            if prior != entry:
+                raise ValueError("Async decision settlement conflicts with checkpoint lineage")
+        else:
+            if len(entries) >= MAX_ARCHIVE_RECORDS:
+                raise ValueError("Async settlement ledger reached its bounded record capacity")
+            entries.append(entry)
+        encoded = json.dumps(entries, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        self.memory.event(
+            "async_decision_settled", schema=1, entries=entries,
+            entries_sha256=hashlib.sha256(encoded).hexdigest())
+        self.memory.async_decision = None
+        # The chosen-plan disposition and cleared pointer become durable in one
+        # checkpoint before the immutable marker is written. A marker without
+        # this retained history row cannot authorize an orphaned request.
+        self._save()
+        self._async_archive.store_settlement(record, entry)
+
+    def _async_reconcile_orphan_archives(self, *, skip_archive_id: str | None = None) -> None:
+        """Fail closed on paid archives absent from the current checkpoint pointer."""
+        from .async_decision_archive import AsyncDecisionArchive
+        from .provider_decision_wal import NOT_SENT
+
+        entries = self._async_settlement_entries()
+        by_id = {entry["archive_id"]: entry for entry in entries}
+        records = self._async_archive.records()
+        for record in records:
+            archive_id = record["archive_id"]
+            if archive_id == skip_archive_id:
+                continue
+            marker = self._async_archive.load_settlement(record)
+            entry = by_id.get(archive_id)
+            lease = self._async_lease_from_record(record)
+            wal_record = lease.inspect_optional()
+            if entry is not None:
+                if (entry["archive_sha256"] != record["record_sha256"]
+                        or entry["request_id"] != record["request_id"]
+                        or entry["wal_record_sha256"] != self._async_wal_record_sha256(wal_record)
+                        or entry["wal_state"] != (wal_record.state if wal_record else None)
+                        or entry["wal_phase"] != (wal_record.phase if wal_record else None)):
+                    raise ValueError("Async settlement no longer matches its archived WAL outcome")
+                if entry["disposition"] == "selected":
+                    self._async_validate_settled_plan(record, entry)
+                if marker is not None and marker != entry:
+                    raise ValueError("Async settlement marker differs from checkpoint lineage")
+                if marker is None:
+                    # Recover a crash after the checkpoint lineage committed but
+                    # before the redundant archive marker reached disk.
+                    self._async_archive.store_settlement(record, entry)
+                continue
+            if marker is not None:
+                raise ValueError(
+                    "Async settlement marker has no retained checkpoint disposition")
+            if wal_record is None:
+                # Archive write precedes the checkpoint pointer and WAL. With
+                # no WAL row, this orphan was never submitted to the provider.
+                continue
+            if wal_record.state == "reserved":
+                # Reservation alone proves that transport was never authorized.
+                # Restore the original health lease before permitting progress.
+                self.jev.abandon_unstarted_decision(lease)
+                wal_record = lease.inspect_optional()
+            if (wal_record is not None and wal_record.state == "failed"
+                    and wal_record.phase == NOT_SENT
+                    and wal_record.error_category == "local_admission"):
+                continue
+            raise ValueError(
+                "Unpointed async request has an unresolved or paid provider outcome")
+
+    def _async_validate_settled_plan(self, record: dict, entry: dict) -> None:
+        """Bind a settled selection to its active plan or verified completion history."""
+        plan_id = entry["selected_plan_id"]
+        plan_rows = [plan for plan in record["selector"]["candidate_plans"]
+                     if plan.get("id") == plan_id]
+        offered_ids = {plan.get("id") for plan in record["selector"]["offered_plans"]}
+        if len(plan_rows) != 1 or plan_id not in offered_ids:
+            raise ValueError("Settled async choice is not an archived offered candidate")
+        plan = plan_rows[0]
+        if fingerprint(plan) != entry["selected_plan_sha256"]:
+            raise ValueError("Settled async choice differs from its archived plan digest")
+        active = self.memory.active_plan
+        if active is not None and active.get("id") == plan_id:
+            if fingerprint(active) != entry["selected_plan_sha256"]:
+                raise ValueError("Active plan differs from its settled async choice")
+            return
+        steps = plan.get("steps")
+        if type(steps) is not list or not steps:
+            raise ValueError("Settled async choice has no verifiable plan steps")
+        for index, step in enumerate(steps):
+            verified = [row for row in self.memory.attempt_outcomes
+                        if row.get("plan_id") == plan_id
+                        and row.get("step_index") == index
+                        and row.get("step_sha256") == fingerprint(step)
+                        and row.get("outcome") == "verified"]
+            if len(verified) != 1:
+                raise ValueError(
+                    "Settled async choice has neither its active plan nor complete verified history")
+
+    def _async_complete_disposition(self, record: dict, disposition: str, *,
+                                    selected_plan_id: str | None = None,
+                                    selected_plan_sha256: str | None = None) -> bool:
+        """Checkpoint a terminal decision, then consume/ack its exact WAL result."""
+        if self.memory is None or self.memory.async_decision is None:
+            raise ValueError("Async decision disposition has no checkpoint pointer")
+        current = self._async_archive.load(self.memory.async_decision)
+        if (current["archive_id"] != record["archive_id"]
+                or current["record_sha256"] != record["record_sha256"]):
+            raise ValueError("Async decision archive changed before disposition")
+        if disposition == "selected" and (
+                self.memory.active_plan is None
+                or self.memory.active_plan.get("id") != selected_plan_id
+                or fingerprint(self.memory.active_plan) != selected_plan_sha256):
+            raise ValueError("Selected async plan is not durably checkpointed")
+        pointer = self._async_archive.pointer(
+            record, disposition=disposition, selected_plan_id=selected_plan_id,
+            selected_plan_sha256=selected_plan_sha256)
+        self.memory.async_decision = pointer
+        # Selected plan (if any) and its immutable decision pointer reach the
+        # checkpoint before the WAL consume transition or health acknowledgment.
+        self._save()
+
+        from .provider_decision_wal import NOT_SENT
+
+        lease = self._async_lease_from_record(record)
+        wal_record = lease.inspect_optional()
+        if wal_record is None:
+            if disposition == "selected":
+                raise ValueError("Selected async plan has no durable provider response")
+        elif wal_record.state == "response_received":
+            if disposition == "cancelled_before_send":
+                raise ValueError("A sent async response cannot be labeled pre-send cancellation")
+            self._async_validate_saved_response(record, wal_record)
+            self._async_wal.consume_response(
+                lease.identity, lease.wal_request, wal_record.result_sha256)
+            self.jev.acknowledge_decision_consumed(lease)
+        elif wal_record.state == "consumed":
+            if disposition == "cancelled_before_send":
+                raise ValueError("A consumed async response cannot be labeled pre-send cancellation")
+            self._async_validate_saved_response(record, wal_record)
+            self.jev.acknowledge_decision_consumed(lease)
+        elif wal_record.state == "reserved":
+            if disposition not in {"cancelled", "cancelled_before_send"}:
+                return False
+            self.jev.abandon_unstarted_decision(lease)
+        elif (wal_record.state == "failed" and wal_record.phase == NOT_SENT
+              and wal_record.error_category == "local_admission"):
+            self.jev.abandon_unstarted_decision(lease)
+        elif (wal_record.state == "failed"
+              and wal_record.phase == "response_received"
+              and wal_record.error_category is not None):
+            if disposition == "selected":
+                raise ValueError("A provider failure cannot authorize a selected plan")
+        else:
+            # MAY_HAVE_BEEN_SENT and ambiguous failures remain owned by this
+            # checkpoint pointer. No new request or action is authorized.
+            return False
+        wal_record = lease.inspect_optional()
+        entry = self._async_archive.settlement_entry(
+            record, disposition=disposition,
+            wal_state=wal_record.state if wal_record is not None else None,
+            wal_phase=wal_record.phase if wal_record is not None else None,
+            wal_record_sha256=self._async_wal_record_sha256(wal_record),
+            selected_plan_id=selected_plan_id,
+            selected_plan_sha256=selected_plan_sha256)
+        self._async_record_settlement(record, entry)
+        self._async_active_record = self._async_active_lease = None
+        self._async_selection_scope = None
+        return True
+
+    def _async_validate_saved_response(self, record: dict, wal_record) -> None:
+        """Revalidate a response receipt before cancellation or crash reconciliation consumes it."""
+        lease = self._async_lease_from_record(record)
+        if wal_record.state == "consumed":
+            from dataclasses import replace
+
+            wal_record = replace(wal_record, state="response_received")
+        result = lease.recover_result(wal_record)
+        if (result.identity != lease.request_identity
+                or result.requested_model != record["provider"]["model_id"]
+                or result.request_payload_sha256 != record["provider"]["payload_sha256"]):
+            raise ValueError("Archived async response identity or payload binding changed")
+        from .judgments import InvalidJudgment, validate_answers
+
+        try:
+            validate_answers(
+                record["selector"]["questions"], _json_mutable(result.answers),
+                quantum=getattr(self._async_provider_client, "answer_quantum", 0))
+        except InvalidJudgment as error:
+            raise ValueError("Archived async response no longer satisfies its exact questions") from error
+
+    def _async_reconcile_terminal_pointer(self) -> None:
+        pointer = self.memory.async_decision if self.memory is not None else None
+        if pointer is None:
+            if self.async_decisions:
+                self._async_reconcile_orphan_archives()
+            return
+        if pointer["disposition"] == "pending":
+            if self.memory.active_plan is not None:
+                raise ValueError("Pending async request conflicts with a committed active plan")
+            self._async_reconcile_orphan_archives(skip_archive_id=pointer["archive_id"])
+            return
+        record = self._async_archive.load(pointer)
+        if pointer["disposition"] == "selected":
+            plan = self.memory.active_plan
+            if (not isinstance(plan, dict) or plan.get("id") != pointer["selected_plan_id"]
+                    or fingerprint(plan) != pointer["selected_plan_sha256"]):
+                raise ValueError("Selected async pointer does not match the durable active plan")
+        elif self.memory.active_plan is not None:
+            raise ValueError("No-action async disposition conflicts with an active plan")
+        if not self._async_complete_disposition(
+                record, pointer["disposition"],
+                selected_plan_id=pointer.get("selected_plan_id"),
+                selected_plan_sha256=pointer.get("selected_plan_sha256")):
+            raise ValueError("Async provider outcome remains unresolved; refusing controller progress")
+        self._async_reconcile_orphan_archives()
+
+    def _async_cancel_request(self) -> bool:
+        pointer = self.memory.async_decision if self.memory is not None else None
+        if pointer is None:
+            return True
+        record = self._async_archive.load(pointer)
+        lease = self._async_lease_from_record(record)
+        wal_record = lease.inspect_optional()
+        from .provider_decision_wal import NOT_SENT, RESPONSE_RECEIVED
+
+        if wal_record is None or wal_record.state == "reserved" or (
+                wal_record.state == "failed" and wal_record.phase == NOT_SENT
+                and wal_record.error_category == "local_admission"):
+            disposition = "cancelled_before_send"
+        elif (wal_record.state in {"response_received", "consumed"}
+              or wal_record.state == "failed" and wal_record.phase == RESPONSE_RECEIVED):
+            disposition = "cancelled"
+        else:
+            # Keep the original request and its WAL owner for ambiguous send
+            # reconciliation. Cancellation never proves remote cancellation.
+            return False
+        completed = self._async_complete_disposition(record, disposition)
+        if completed:
+            input_sha256 = record["selector"].get("persistent_input_sha256")
+            if input_sha256 is not None and self.memory.blocked_recovery is not None:
+                from .blocked_persistence import find_attempt, finish_attempt
+                row = find_attempt(
+                    self.memory, self.provenance["code_revision"], input_sha256,
+                    archive_index=self._blocked_recovery_archive_index)
+                if row is not None and row.get("outcome") == "pending":
+                    finish_attempt(
+                        self.memory, self.provenance["code_revision"], input_sha256,
+                        "failed", archive_index=self._blocked_recovery_archive_index)
+                    self._save()
+        return completed
+
+    def _async_resume_pending_selection(self, snapshot: GameSnapshot,
+                                        current_state: dict,
+                                        current_plans: list[Plan]) -> dict | None:
+        pointer = self.memory.async_decision if self.memory is not None else None
+        if pointer is None:
+            return None
+        if pointer["disposition"] != "pending":
+            self._async_reconcile_terminal_pointer()
+            return None
+        record = self._async_archive.load(pointer)
+        selector = record["selector"]
+        lease = self._async_lease_from_record(record)
+        self._async_active_record, self._async_active_lease = record, lease
+
+        def no_action(reason: str, *, stale: bool = False) -> dict:
+            from .provider_decision_wal import NOT_SENT
+
+            wal_record = lease.inspect_optional()
+            called = (wal_record is not None and wal_record.phase != NOT_SENT)
+            completed = self._async_complete_disposition(
+                record, "stale" if stale else "no_action")
+            if not completed:
+                decision = Decision(
+                    None, "observe", "Async request remains ambiguous; no action is authorized",
+                    state=selector["state"], questions=selector["questions"],
+                    model_called=called,
+                    diagnostics={"schema": 1, "outcome": "provider_blocked",
+                                 "provider": deepcopy(self.jev.state)})
+            else:
+                decision = Decision(
+                    None, "observe", reason, state=selector["state"],
+                    questions=selector["questions"], model_called=called,
+                    diagnostics={"schema": 1,
+                                 "outcome": "stale_async_response" if stale else "async_no_action"})
+            return {"decision": decision, "chosen": None,
+                    "input_sha256": selector.get("persistent_input_sha256"),
+                    "finalized": False, "trace_done": False}
+
+        runtime = self._async_runtime_identity
+        provider_id = self._async_provider_client.decision_provider_id()
+        model_id = getattr(self._async_provider_client, "model", None)
+        identity = record["identity"]
+        actor_id = None
+        if isinstance(runtime, dict):
+            encoded = json.dumps(runtime, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":"), allow_nan=False).encode("utf-8")
+            actor_id = "actor:" + hashlib.sha256(encoded).hexdigest()
+        compatible = (
+            selector["source_revision"] == self.provenance.get("code_revision")
+            and selector["session_id"] == snapshot.session_id == self.memory.session_id
+            and self._async_json_equal(selector["runtime_identity"], runtime)
+            and selector["actor_id"] == actor_id
+            and identity["session_id"] == snapshot.session_id
+            and identity["actor_id"] == actor_id
+            and selector["target"] == self.target
+            and selector["policy"] == self.policy
+            and selector["confidence_floor"] == self.confidence_floor
+            and selector["max_request_bytes"] == self.max_request_bytes
+            and record["provider"]["provider_id"] == provider_id
+            and record["provider"]["model_id"] == model_id
+        )
+        if not compatible:
+            return no_action(
+                "Archived async decision no longer matches source, actor, provider, or state",
+                stale=True)
+
+        from .judgments import question_batch
+
+        try:
+            archived_plans = [Plan.from_dict(row) for row in selector["candidate_plans"]]
+            context, questions, offered = question_batch(
+                selector["source_state"], archived_plans,
+                max_bytes=selector["max_request_bytes"])
+            regenerated = (context, questions, [plan.to_dict() for plan in offered])
+            saved = (selector["state"], selector["questions"], selector["offered_plans"])
+            if (not self._async_json_equal(regenerated, saved)
+                    or fingerprint(selector["candidate_plans"]) != selector["frontier_sha256"]):
+                return no_action("Archived async selector context failed validation", stale=True)
+            from .causal_trace import describe_request_order
+            if not self._async_json_equal(
+                    describe_request_order(context, questions), selector["request_order"]):
+                return no_action("Archived async request order failed validation", stale=True)
+            payload = self._async_provider_client.prepare_decision_payload(context, questions)
+            if not self._async_json_equal(payload, record["provider"]["payload"]):
+                return no_action("Archived async provider payload is stale", stale=True)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return no_action("Archived async selector is malformed", stale=True)
+
+        # A fresh observation's clock and known planner receipt timestamps can
+        # advance while the provider is working. Compare the source-bound
+        # decision semantics through the same clock-normalized fingerprint
+        # used by persistent selection, then let the ordinary fresh
+        # pre-dispatch checks decide whether the selected action is still safe.
+        # The provider result below is always reduced against the archived
+        # request and candidate set, never a newly generated request.
+        try:
+            common = {
+                "session_id": snapshot.session_id,
+                "source_revision": selector["source_revision"],
+                "target": selector["target"],
+                "policy": selector["policy"],
+                "confidence_floor": selector["confidence_floor"],
+                "max_request_bytes": selector["max_request_bytes"],
+            }
+            archived_semantics = self._async_semantic_selection_sha256(
+                selector["source_state"], selector["candidate_plans"],
+                current_tick=selector["observation_tick"], **common)
+            current_semantics = self._async_semantic_selection_sha256(
+                current_state, [plan.to_dict() for plan in current_plans],
+                current_tick=snapshot.tick, **common)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return no_action("Archived async candidate context failed validation", stale=True)
+        if archived_semantics != current_semantics:
+            return no_action("Archived async candidate frontier is stale", stale=True)
+
+        self._async_selection_scope = {
+            "source_state": selector["source_state"], "state": selector["state"],
+            "questions": selector["questions"], "record": record, "lease": lease,
+        }
+        try:
+            with phase("selection", self._diagnostic_trace):
+                decision = select_plan(
+                    self._trace.client(self._async_decision_adapter),
+                    selector["source_state"], archived_plans,
+                    selector["confidence_floor"], selector["max_request_bytes"],
+                    prepared_batch=(selector["state"], selector["questions"], offered))
+        except _AsyncStepCancelled:
+            self._async_cancel_request()
+            decision = Decision(
+                None, "observe", "Async selection was cancelled before plan dispatch",
+                state=selector["state"], questions=selector["questions"],
+                diagnostics={"schema": 1, "outcome": "async_cancelled"})
+            return {"decision": decision, "chosen": None,
+                    "input_sha256": selector.get("persistent_input_sha256"),
+                    "finalized": False, "trace_done": False}
+        if self._async_cancel_requested():
+            self._async_cancel_request()
+            decision = Decision(
+                None, "observe", "Async selection was cancelled before plan dispatch",
+                state=decision.state, questions=decision.questions,
+                model_called=decision.model_called,
+                diagnostics={"schema": 1, "outcome": "async_cancelled"})
+            return {"decision": decision, "chosen": None,
+                    "input_sha256": selector.get("persistent_input_sha256"),
+                    "finalized": False, "trace_done": False}
+
+        chosen_archived = next((plan for plan in offered
+                                if plan.id == decision.plan_id), None)
+        if decision.diagnostics.get("outcome") == "provider_blocked":
+            self._async_complete_disposition(record, "no_action")
+            chosen = None
+        elif chosen_archived is None:
+            self._async_complete_disposition(record, "no_action")
+            chosen = None
+        else:
+            chosen = next((plan for plan in current_plans
+                           if plan.id == chosen_archived.id
+                           and self._async_json_equal(plan.to_dict(),
+                                                      chosen_archived.to_dict())), None)
+            if chosen is None:
+                if not self._async_complete_disposition(record, "stale"):
+                    decision = Decision(
+                        None, "observe", "Archived async response is stale and outcome remains ambiguous",
+                        state=selector["state"], questions=selector["questions"],
+                        model_called=True,
+                        diagnostics={"schema": 1, "outcome": "provider_blocked",
+                                     "provider": deepcopy(self.jev.state)})
+                else:
+                    decision = Decision(
+                        None, "observe", "Archived async response selected a stale candidate",
+                        state=selector["state"], questions=selector["questions"],
+                        model_called=True,
+                        diagnostics={"schema": 1, "outcome": "stale_async_response"})
+        return {"decision": decision, "chosen": chosen,
+                "input_sha256": selector.get("persistent_input_sha256"),
+                "finalized": False, "trace_done": False}
+
+    def _async_evaluate_request(self, state: dict, questions: dict) -> dict:
+        execution = self._async_execution_context()
+        scope = self._async_selection_scope
+        if not isinstance(scope, dict):
+            raise RuntimeError("Async selection request was not durably prepared")
+        if (not self._async_json_equal(state, scope["state"])
+                or not self._async_json_equal(questions, scope["questions"])):
+            raise ValueError("Reducer request differs from the frozen async selection context")
+        lease = scope.get("lease")
+        if lease is None:
+            raise RuntimeError("Async request archive has no reconstructed lease")
+        if execution["cancelled"].is_set():
+            raise _AsyncStepCancelled
+        bridge = execution["bridge"]
+        result = bridge.call(lambda: self.jev.evaluate_async(
+            state, questions, identity=lease.request_identity,
+            deadline=time.monotonic() + self.async_decision_timeout,
+            decision_lease=lease,
+        ))
+        self._async_active_record = scope["record"]
+        self._async_active_lease = lease
+        projection = {
+            "answers": _json_mutable(result.answers),
+            "usage": _json_mutable(result.usage),
+            "requested_model": result.requested_model,
+            "resolved_model": _json_mutable(result.resolved_model),
+            "request_id": lease.identity.request_id,
+            "request_payload_sha256": lease.request_payload_sha256,
+        }
+        return projection
+
+    def _async_cancel_before_send(self) -> None:
+        pointer = self.memory.async_decision if self.memory is not None else None
+        if pointer is None:
+            return
+        record = self._async_archive.load(pointer)
+        lease = self._async_lease_from_record(record)
+        wal_record = lease.inspect_optional()
+        if wal_record is None:
+            pass
+        elif wal_record.state == "reserved":
+            self.jev.abandon_unstarted_decision(lease)
+        else:
+            # A transport-entered, response-bearing, or terminal request keeps
+            # its exact archive pointer for later reconciliation.
+            self._async_active_record, self._async_active_lease = record, lease
+            return
+        self.memory.async_decision = self._async_archive.pointer(
+            record, disposition="cancelled_before_send")
+        self._save()
+        self.memory.async_decision = None
+        self._save()
+        self._async_active_record = self._async_active_lease = None
+        self._async_selection_scope = None
 
     @property
     def terminal(self) -> bool:
@@ -456,12 +1546,23 @@ class HierarchicalLoop(AgentLoop):
             self.memory,aliases,archive_index=self._blocked_recovery_archive_index)
         carried_keys={(row["source_revision"]["commit"],row["source_revision"]["source_sha256"],
                        row["decision_input_sha256"]) for row in carried}
+        async_pending_record = None
+        async_pending_input = None
+        if self.async_decisions and self.memory.async_decision is not None:
+            async_pending_record = self._async_archive.load(self.memory.async_decision)
+            async_pending_input = async_pending_record["selector"].get(
+                "persistent_input_sha256")
         seen_candidates = set(carried_seen) | {
             offered["candidate_sha256"] for row in rows
             if (row["source_revision"]["commit"],row["source_revision"]["source_sha256"],
                 row["decision_input_sha256"]) not in carried_keys
             for offered in row["selection_batch"]["offered"]}
         for row in rows:
+            if (async_pending_record is not None and row.get("outcome") == "pending"
+                    and row.get("decision_input_sha256") == async_pending_input):
+                seen_candidates.difference_update(
+                    item["candidate_sha256"] for item in row["selection_batch"]["offered"])
+                continue
             if row.get("outcome") != "rejected" or not is_recoverable_reason(row.get("reason")):
                 return {"record": self._persistent_wait(
                     snapshot, row["decision_input_sha256"])}
@@ -481,6 +1582,17 @@ class HierarchicalLoop(AgentLoop):
 
         def unseen_plans():
             return [plan for plan in plans if candidate_digests[plan.id] not in seen_candidates]
+
+        if async_pending_record is not None:
+            pending_row = next((row for row in rows
+                                if row.get("outcome") == "pending"
+                                and row.get("decision_input_sha256") == async_pending_input), None)
+            if pending_row is None:
+                return {"record": self._persistent_wait(snapshot, async_pending_input)}
+            resumed = self._async_resume_pending_selection(snapshot, state, unseen_plans())
+            if resumed is None:
+                raise ValueError("Pending async selection disappeared during recovery")
+            return resumed
 
         legacy_reason = self.memory.reason
         if len(rows) >= MAX_SELECTION_BATCHES_PER_STATE:
@@ -535,11 +1647,7 @@ class HierarchicalLoop(AgentLoop):
                 return {"record": self._persistent_wait(
                     snapshot, input_sha256, source_authorized=source_auth_pending)}
 
-            self._record_persistent_attempt(
-                snapshot, input_sha256, source_authorized=source_auth_pending,
-                authorization_reason=authorization_reason,
-                selection_batch=metadata)
-            source_auth_pending = False
+            batch_source_authorized = source_auth_pending
             self._persistent_runtime_wait_level = 0
             self._persistent_idle_waits = 0
             self._persistent_recovery_status = {
@@ -552,16 +1660,54 @@ class HierarchicalLoop(AgentLoop):
                 "offered_candidate_count": len(offered),
                 "recorded_attempts": self._blocked_recovery_attempt_count(),
             }
+            async_client = self.jev
+            async_request = False
+            if self.async_decisions:
+                from .judgments import is_lone_passive_background_wait
+
+                if not is_lone_passive_background_wait(remaining):
+                    async_request = True
+                    self._async_prepare_selection(
+                        snapshot=snapshot, source_state=state, state=context,
+                        questions=questions, plans=remaining, offered=offered,
+                        selection_batch=metadata,
+                        persistent_input_sha256=input_sha256,
+                        source_authorized=batch_source_authorized,
+                        authorization_reason=authorization_reason,
+                        checkpoint_update=lambda: self._record_persistent_attempt(
+                            snapshot, input_sha256,
+                            source_authorized=batch_source_authorized,
+                            authorization_reason=authorization_reason,
+                            selection_batch=metadata, save=False))
+                    async_client = self._async_decision_adapter
+                else:
+                    self._async_selection_scope = None
+            if not async_request:
+                self._record_persistent_attempt(
+                    snapshot, input_sha256, source_authorized=batch_source_authorized,
+                    authorization_reason=authorization_reason,
+                    selection_batch=metadata)
+            source_auth_pending = False
             try:
                 with phase("selection", self._diagnostic_trace):
                     self._decision = select_plan(
-                        self._trace.client(self.jev), state, remaining,
+                        self._trace.client(async_client), state, remaining,
                         self.confidence_floor, self.max_request_bytes,
                         prepared_batch=(context, questions, offered))
+            except _AsyncStepCancelled:
+                self._async_cancel_request()
+                return {"record": self._record(
+                    snapshot, "observe",
+                    "Async selection cancelled; provider delivery phase was preserved without action")}
             except ValueError as error:
                 self._decision = Decision(
                     None, "observe", str(error), state=context,
                     diagnostics={"schema": 1, "outcome": "request_rejected"})
+
+            if self.async_decisions and self._async_cancel_requested():
+                self._async_cancel_request()
+                return {"record": self._record(
+                    snapshot, "observe", "Async selection was cancelled before plan persistence")}
 
             pruned = self._decision.diagnostics.get("pruned_candidate_ids")
             if pruned:
@@ -595,6 +1741,16 @@ class HierarchicalLoop(AgentLoop):
             finish_attempt(self.memory, source, input_sha256, "rejected", reason,
                            archive_index=self._blocked_recovery_archive_index)
             self._save()
+            if self.async_decisions and self.memory.async_decision is not None:
+                record = self._async_archive.load(self.memory.async_decision)
+                if not self._async_complete_disposition(record, "no_action"):
+                    return {"decision": Decision(
+                        None, "observe", "Async result remains unresolved; no action is authorized",
+                        state=context, questions=questions, model_called=True,
+                        diagnostics={"schema": 1, "outcome": "provider_blocked",
+                                     "provider": deepcopy(self.jev.state)}),
+                        "chosen": None, "input_sha256": input_sha256,
+                        "finalized": False, "trace_done": True}
             seen_candidates.update(
                 item["candidate_sha256"] for item in metadata["offered"])
             rows.append({"decision_input_sha256": input_sha256,
@@ -626,14 +1782,15 @@ class HierarchicalLoop(AgentLoop):
                                    source_authorized: bool = False,
                                    authorization_reason: str | None = None,
                                    outcome: str = "pending",
-                                   selection_batch: dict | None = None) -> None:
+                                   selection_batch: dict | None = None,
+                                   save: bool = True) -> None:
         """Write-ahead one decision fingerprint before model selection."""
         if source_authorized:
             # The changed-contract source authorization and its first concrete
             # fingerprint share the same durable checkpoint commit.
             self._consume_blocked_reevaluation(
                 snapshot, input_sha256, authorization_reason=authorization_reason,
-                persistent_outcome=outcome, selection_batch=selection_batch)
+                persistent_outcome=outcome, selection_batch=selection_batch, save=save)
             return
         from .blocked_persistence import is_recoverable_reason, finish_attempt, record_attempt
         self._archive_full_recovery_tail()
@@ -652,7 +1809,8 @@ class HierarchicalLoop(AgentLoop):
             self.memory.event(
                 "blocked_recovery_attempt", decision_input_sha256=input_sha256,
                 tick=snapshot.tick, source_head=self.provenance["code_revision"]["commit"])
-            self._save()
+            if save:
+                self._save()
         except BaseException:
             self.memory.blocked_recovery = prior_recovery
             self.memory.history = prior_history
@@ -820,7 +1978,8 @@ class HierarchicalLoop(AgentLoop):
                                       persistent_input: str | None = None, *,
                                       authorization_reason: str | None = None,
                                       persistent_outcome: str = "pending",
-                                      selection_batch: dict | None = None) -> None:
+                                      selection_batch: dict | None = None,
+                                      save: bool = True) -> None:
         """Durably consume the one-use authorization before any model request."""
         from .blocked_reevaluation import validate_blocked_memory
 
@@ -876,7 +2035,8 @@ class HierarchicalLoop(AgentLoop):
                 self.memory.event("blocked_recovery_attempt", decision_input_sha256=persistent_input,
                                   tick=snapshot.tick,
                                   source_head=self.provenance["code_revision"]["commit"])
-            self._save()
+            if save:
+                self._save()
         except BaseException:
             self.memory.history = prior_history
             self.memory.blocked_reevaluations = prior_ledger
@@ -904,6 +2064,7 @@ class HierarchicalLoop(AgentLoop):
             self.memory = self._initial_memory(snapshot)
         if self.memory.session_id != snapshot.session_id or snapshot.tick < self.memory.last_tick:
             raise ValueError("Session changed or observation tick regressed; refusing to act")
+        self._validate_async_observation(snapshot)
         self.memory.last_tick = snapshot.tick
         if snapshot.world_kind == 'fle' or self.memory.connector_ownership is not None:
             from .connector_checkpoint import reconcile
@@ -1012,6 +2173,9 @@ class HierarchicalLoop(AgentLoop):
                 verified=verified)
         with span("record_construct"):
             decision = self._decision
+            async_result = (self._async_last_result
+                            if self.async_decisions and decision is not None
+                            and decision.model_called else None)
             record = {
                 **self.provenance,
                 "schema_version": 2, "controller": "hierarchical", "policy": self.policy,
@@ -1023,9 +2187,14 @@ class HierarchicalLoop(AgentLoop):
                 "completed_goals": dict(self.memory.completed_goals),
                 "decision": asdict(decision) if decision else None,
                 "model_call": decision is not None and decision.model_called,
-                "requested_model": getattr(self.jev, "model", None),
-                "resolved_model": getattr(self.jev, "last_model", None) if decision and decision.model_called else None,
-                "usage": getattr(self.jev, "last_usage", None) if decision and decision.model_called else None,
+                "requested_model": (async_result.get("requested_model") if async_result else
+                                    getattr(self.jev, "model", None)),
+                "resolved_model": (async_result.get("resolved_model") if async_result else
+                                   getattr(self.jev, "last_model", None)
+                                   if decision and decision.model_called else None),
+                "usage": (async_result.get("usage") if async_result else
+                          getattr(self.jev, "last_usage", None)
+                          if decision and decision.model_called else None),
                 "pending": deepcopy(self.memory.pending), "history": deepcopy(self.memory.history[-8:]),
                 "process_id": self._process_id, "recorded_at_utc": utc_now(),
                 "phases": deepcopy(self._phases), "attempt": deepcopy(self.memory.attempt),
@@ -1084,13 +2253,16 @@ class HierarchicalLoop(AgentLoop):
 
     def _model_history(self) -> list:
         if not self.persist_recoverable_blocks:
-            return self.memory.history[-8:]
+            return [event for event in self.memory.history
+                    if event.get("kind") != "async_decision_settled"][-8:]
         from .blocked_persistence import _SYSTEM_HISTORY_EVENTS
         from .paid_selection_reconciliation import validate_representation_budget_carry
         import subprocess
         result=[]
         for event in self.memory.history:
-            if event.get("kind") in _SYSTEM_HISTORY_EVENTS:continue
+            if (event.get("kind") in _SYSTEM_HISTORY_EVENTS
+                    or event.get("kind") == "async_decision_settled"):
+                continue
             if event.get("kind") == "paid_duplicate_selection_reconciled":
                 try:
                     validate_representation_budget_carry(self.memory,event,
@@ -1685,9 +2857,12 @@ class HierarchicalLoop(AgentLoop):
         return min(plans, key=lambda plan: (len(plan.steps), plan.id))
 
     @traced_step
+    @_serialized_async_actor
     def step(self) -> dict:
         self._persistent_recovery_status = None
         self._decision = None
+        self._async_last_result = None
+        self._async_last_outcome = None
         self._selection_support = {}
         self._planning_diagnostics = {}
         self._trace.observation_phase = "before_decision"
@@ -1696,6 +2871,8 @@ class HierarchicalLoop(AgentLoop):
         self._performance = PerformanceCounters()
         self._trace.metrics = self._performance if self.factory_scheduling == "ready-work" else None
         snapshot = self._observe()
+        if self.async_decisions:
+            self._async_reconcile_terminal_pointer()
         blocked_reevaluation = self._reevaluate_blocked_once
         blocked_reevaluation_reason = self.memory.reason if blocked_reevaluation else None
         persistent_blocked = self._persistent_block_active()
@@ -1887,12 +3064,49 @@ class HierarchicalLoop(AgentLoop):
                     alternative_wait = result.get("wait_phase")
                     if alternative_wait is not None:
                         alternative_status = result
+                elif self.async_decisions and self.memory.async_decision is not None:
+                    result = self._async_resume_pending_selection(snapshot, state, plans)
+                    if result is None:
+                        raise ValueError("Pending async request vanished before recovery")
+                    self._decision = result["decision"]
+                    chosen = result["chosen"]
+                    persistent_input_sha256 = result["input_sha256"]
+                    persistent_attempt_finalized = result["finalized"]
+                    persistent_trace_done = result["trace_done"]
                 else:
                     try:
+                        prepared_batch = None
+                        client = self.jev
+                        if self.async_decisions:
+                            from .judgments import question_batch, is_lone_passive_background_wait
+
+                            context, questions, offered = question_batch(
+                                state, plans, max_bytes=self.max_request_bytes)
+                            prepared_batch = (context, questions, offered)
+                            if not is_lone_passive_background_wait(plans):
+                                self._async_prepare_selection(
+                                    snapshot=snapshot, source_state=state,
+                                    state=context, questions=questions,
+                                    plans=plans, offered=offered)
+                                client = self._async_decision_adapter
+                            else:
+                                self._async_selection_scope = None
                         with phase("selection", self._diagnostic_trace):
-                            self._decision = select_plan(
-                                self._trace.client(self.jev), state, plans,
-                                self.confidence_floor, self.max_request_bytes)
+                            traced_client = self._trace.client(client)
+                            if self.async_decisions:
+                                self._decision = select_plan(
+                                    traced_client, state, plans,
+                                    self.confidence_floor, self.max_request_bytes,
+                                    prepared_batch=prepared_batch)
+                            else:
+                                self._decision = select_plan(
+                                    traced_client, state, plans,
+                                    self.confidence_floor, self.max_request_bytes)
+                    except _AsyncStepCancelled:
+                        self._async_cancel_request()
+                        return self._record(
+                            snapshot, "observe",
+                            "Async selection cancelled; provider delivery phase was preserved without action")
                     except ValueError as error:
                         self._decision = Decision(
                             None, "observe", str(error), state=state,
@@ -1903,6 +3117,11 @@ class HierarchicalLoop(AgentLoop):
                               f"{self._decision.diagnostics.get('input_candidates')} candidates "
                               f"({self._decision.diagnostics.get('request_bytes')}/"
                               f"{self.max_request_bytes} bytes): {', '.join(pruned)}", flush=True)
+                if self.async_decisions and self._async_cancel_requested():
+                    self._async_cancel_request()
+                    return self._record(
+                        snapshot, "observe",
+                        "Async step cancelled before selected-plan persistence")
                 if self._decision.diagnostics.get("outcome") == "provider_blocked":
                     # Operational denial is neither model abstention nor planning
                     # failure. No hybrid fallback and no consumed gameplay budget.
@@ -1966,6 +3185,11 @@ class HierarchicalLoop(AgentLoop):
                             }
                     if not persistent_trace_done:
                         self._trace_decision()
+                    if self.async_decisions and self._async_cancel_requested():
+                        self._async_cancel_request()
+                    if self.async_decisions and self.memory.async_decision is not None:
+                        record = self._async_archive.load(self.memory.async_decision)
+                        self._async_complete_disposition(record, "no_action")
                     return self._record(snapshot, "observe", self._decision.reason)
                 if not persistent_selection_mode:
                     chosen = next((p for p in plans if p.id == self._decision.plan_id), None)
@@ -1975,6 +3199,10 @@ class HierarchicalLoop(AgentLoop):
                         self._decision.source = "deterministic-fallback"
                 if not persistent_trace_done:
                     self._trace_decision()
+                if self.async_decisions and self._async_cancel_requested():
+                    self._async_cancel_request()
+                    return self._record(
+                        snapshot, "observe", "Async step cancelled before plan persistence")
                 if chosen is None:
                     if alternative_wait is not None:
                         return self._record_alternative_frontier_status(
@@ -2016,7 +3244,24 @@ class HierarchicalLoop(AgentLoop):
                             "decision_input_sha256": persistent_input_sha256,
                             "recorded_attempts": self._blocked_recovery_attempt_count(),
                         }
+                    if self.async_decisions and self.memory.async_decision is not None:
+                        record = self._async_archive.load(self.memory.async_decision)
+                        self._async_complete_disposition(record, "no_action")
                     return self._record(snapshot, "observe", self.memory.reason)
+            if self.async_decisions and self.memory.async_decision is not None:
+                pointer = self.memory.async_decision
+                record = self._async_archive.load(pointer)
+                selector = record["selector"]
+                if (self._decision.source == "deterministic-fallback"
+                        or not any(self._async_json_equal(chosen.to_dict(), offered)
+                                   for offered in selector["offered_plans"])):
+                    # A deterministic fallback is not authorized by the model
+                    # response. Consume its no-action result before committing
+                    # the separate fallback plan.
+                    if not self._async_complete_disposition(record, "no_action"):
+                        return self._record(
+                            snapshot, "observe",
+                            "Async provider result remains unresolved; no fallback is authorized")
             from .capital_controller import commit as commit_capital
             commit_capital(self, chosen, snapshot)
             if getattr(self, "_commit_solid", None):
@@ -2047,7 +3292,20 @@ class HierarchicalLoop(AgentLoop):
                 finish_attempt(self.memory, self.provenance["code_revision"],
                                persistent_input_sha256, "selected",
                                archive_index=self._blocked_recovery_archive_index)
-            self._save()
+            if self.async_decisions and self.memory.async_decision is not None:
+                record = self._async_archive.load(self.memory.async_decision)
+                selected = next((offered for offered in record["selector"]["offered_plans"]
+                                 if offered.get("id") == chosen.id), None)
+                if (selected is None or not self._async_json_equal(selected, chosen.to_dict())
+                        or self._decision.source == "deterministic-fallback"):
+                    raise ValueError("Chosen plan is not the exact archived async candidate")
+                completed = self._async_complete_disposition(
+                    record, "selected", selected_plan_id=chosen.id,
+                    selected_plan_sha256=fingerprint(self.memory.active_plan))
+                if not completed:
+                    raise ValueError("Async selected plan lacks a consumable exact provider response")
+            else:
+                self._save()
             if self._trace.enabled:
                 self._trace.emit("plan_committed", {"plan_id": chosen.id, "plan": chosen.to_dict(),
                                                     "source": self._decision.source})
@@ -2055,6 +3313,9 @@ class HierarchicalLoop(AgentLoop):
         # The world can change while a remote model evaluates the old snapshot.
         self._trace.observation_phase = "before_dispatch"
         fresh = self._observe("pre_dispatch_observe")
+        if self.async_decisions and self._async_cancel_requested():
+            return self._record(
+                snapshot, "observe", "Async step cancelled before fresh action admission", fresh)
         if self._execution_barrier(fresh):
             return self._record(snapshot, "observe", self.memory.reason, fresh)
         if self._safety:
@@ -2101,6 +3362,14 @@ class HierarchicalLoop(AgentLoop):
         self._save()
         try:
             def dispatch():
+                if self.async_decisions:
+                    execution = self._async_execution_context()
+                    with execution["dispatch_gate"]:
+                        if execution["cancelled"].is_set():
+                            raise _AsyncStepCancelled
+                        # Cancellation after this point waits for the ordinary
+                        # dispatch receipt and verification before returning.
+                        execution["dispatch_entered"] = True
                 if step.action.startswith("factory_"):
                     traced = getattr(self.backend, "execute_traced", None)
                     return (traced(step.action, step.parameters or {}, self._diagnostic_trace) if traced else
@@ -2127,6 +3396,28 @@ class HierarchicalLoop(AgentLoop):
             self.memory.pending = None
             self._trace.clear_pending()
             return self._record(snapshot, "observe", reason, fresh)
+        except _AsyncStepCancelled:
+            execution = self._async_execution_context()
+            if execution["dispatch_entered"]:
+                # The operation crossed its admission boundary; keep the exact
+                # original pending attempt for ordinary postcondition recovery.
+                self.memory.pending["dispatch"] = "ambiguous"
+                self.memory.event("dispatch_error", error_type="cancelled_after_entry",
+                                  tick=fresh.tick)
+                return self._record(
+                    snapshot, step.action,
+                    "Async cancellation arrived after dispatch entry; verification required",
+                    fresh)
+            attempt_id = self.memory.attempt["id"]
+            self.memory.event("dispatch_cancelled_before_entry", attempt_id=attempt_id,
+                              plan_id=plan.id, step_index=index, tick=fresh.tick)
+            self._finish_attempt(fresh, "cancelled_before_dispatch")
+            self.memory.release(plan.id)
+            self.memory.pending = None
+            self._trace.clear_pending()
+            self._save()
+            return self._record(
+                snapshot, "observe", "Async step cancelled before action dispatch", fresh)
         except Exception as error:
             if self._persistence_failed:
                 raise  # A phase checkpoint failure is not a backend acknowledgement.
