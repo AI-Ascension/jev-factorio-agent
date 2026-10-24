@@ -27,6 +27,9 @@ _SOLID_COAL_WITH_OBSERVATIONS_MODULES = _SOLID_COAL_MODULES | {
     'observation', 'observation_v2',
 }
 _FULL_SOLID_COAL_MODULES = CURRENT_MODULES | {'solid_routes', 'coal_supply'}
+_SUCCESSOR_MODULES = (CURRENT_MODULES - {'mining_outposts'}) | {'successors'}
+_SUCCESSOR_SOLID_MODULES = _SUCCESSOR_MODULES | {'solid_routes'}
+_SUCCESSOR_SOLID_COAL_MODULES = _SUCCESSOR_SOLID_MODULES | {'coal_supply'}
 
 # These are the exact source-generated launch compositions covered by the
 # bundled-installer qualification tests. This is intentionally not a generic
@@ -44,6 +47,12 @@ DIRECT_MODULE_PROFILES = {
     'solid_and_coal_with_observations': _SOLID_COAL_WITH_OBSERVATIONS_MODULES,
     'current_full': CURRENT_MODULES,
     'solid_and_coal_with_prerequisites': _FULL_SOLID_COAL_MODULES,
+    # Exact CLI compositions: successor producers require input, buffers,
+    # production sites, craft jobs and forbid mining outposts. Treatment may
+    # compose with successors, but it cannot make an outpost-compatible profile.
+    'current_successors': _SUCCESSOR_MODULES,
+    'successors_with_solid': _SUCCESSOR_SOLID_MODULES,
+    'successors_with_solid_and_coal': _SUCCESSOR_SOLID_COAL_MODULES,
 }
 
 
