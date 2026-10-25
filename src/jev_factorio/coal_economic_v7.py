@@ -169,7 +169,10 @@ rcon.print(envelope)'''
 def _compose_query(*, first_spend: bool = False) -> str:
     root = files('jev_factorio').joinpath('lua')
     base = root.joinpath('coal_economics.lua').read_text()
-    coal_supply = root.joinpath('coal_supply.lua').read_bytes()
+    # This query authorizes only its original installed builder. Completion
+    # inspection adds helpers to the current direct-install asset; that must
+    # not silently migrate the frozen v7 payment contract or its asset pin.
+    coal_supply = root.joinpath('coal_supply_v7.lua').read_bytes()
     census = root.joinpath('coal_material_census_v7.lua').read_text()
     cycle = root.joinpath('coal_manual_cycle_v2.lua').read_bytes()
     admission = root.joinpath('coal_native_admission_v1.lua').read_text()

@@ -54,6 +54,14 @@ installations derive their hashes from the reviewed Lua source separately.
 The compatibility controls use an unchanged complete legacy manifest and
 reject both corrupted hashes and a replacement hash under the frozen profile.
 
+The frozen v7 coal-economics and first-payment queries retain their original
+builder pin and byte-identical emitted queries. Their compiler validates the
+separately packaged `lua/coal_supply_v7.lua`, which preserves the exact earlier
+builder bytes. Current direct installations still use `lua/coal_supply.lua`
+with the read-only completion helpers. A current builder cannot satisfy the
+old v7 native manifest by using the historical filename or pin; new admission
+support would require a separately reviewed versioned contract.
+
 Retained paid commitments are matched to current records by their source,
 layout, part roles and units, receipts, and complete-flow evidence. Successor
 projects additionally require the current qualified project, predecessor,
