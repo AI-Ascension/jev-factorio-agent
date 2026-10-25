@@ -1,0 +1,44 @@
+"""Prepare the corrected power-scope contract for one-use V46 handoff."""
+from pathlib import Path
+import hashlib, json, subprocess, re, sys
+root = Path(__file__).parent
+repo = Path('jev-power-lookahead-production-20261007').resolve()
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(repo / 'src'))
+from jev_factorio.provenance import source_revision
+revision = source_revision(repo, timeout=60)
+git = lambda *args: subprocess.check_output(['git','-C',str(repo),*args])
+assert not git('status','--porcelain').strip()
+assert revision and revision['commit']=='e058636c3c046221733c9ea632f717efeb20e834'
+pin={**revision,'tree':git('rev-parse','HEAD^{tree}').decode().strip(),
+     'archive_sha256':hashlib.sha256(git('archive','--format=tar','HEAD')).hexdigest()}
+old=(root/'continuous_owner_v46.py').read_bytes()
+assert hashlib.sha256(old).hexdigest()=='3e43cd362a6158134961ddae1900b20952e0469489695b402f0666a183f935a4'
+owner=old.decode().replace('v46','v47').replace('attempts >= 46','attempts >= 47')
+owner_sha=hashlib.sha256(owner.encode()).hexdigest()
+for name,content in [('continuous_owner_v47.py',owner),('production-v47-source-pin.json',json.dumps(pin,sort_keys=True)+'\n')]:
+    with (root/name).open('xb') as stream:stream.write(content.encode())
+mapping={
+ 'v46':'v47','v45':'v46',
+ '678f2eac3f6f8ad1b850dd5e6b9c7e1df8723efc':revision['commit'],
+ 'ee70a1170d850a76125a67ee1444a5f37bf8f035':'678f2eac3f6f8ad1b850dd5e6b9c7e1df8723efc',
+ '7a3b5eca152e31374be447a678033034b7b144fdf9c0db7f42c1f50cc1a7b6da':'a4c5f9b0fc9aaa8b8552f0f2899e38a99e2d03c1293980b5033b0534d0efc42a',
+ '3e43cd362a6158134961ddae1900b20952e0469489695b402f0666a183f935a4':owner_sha,
+ 'af9187ef8b71cc5350881a92d5b040470b0d01a9870f459de0b63c161ebc7718':'3e43cd362a6158134961ddae1900b20952e0469489695b402f0666a183f935a4',
+ '70c93f2d83e4476c936a1c50477f454f':'c34b8ea09333488487d577c2b0038009',
+ '2303695':'2342994','2303711':'2343015','==45':'==46',
+ '83374ae4731a085ae9467b76721650474908c7d4fc197c18fffe816e3b648703':'AWAITING_V46_TERMINAL_DIGEST',
+ "cp['reason']=='Candidate evidence insufficient'":"cp['reason']=='AWAITING_V46_TERMINAL_REASON'",
+ 'reviewed power-lookahead scope repair':'reviewed versioned power-scope compatibility repair',
+}
+pattern=re.compile('|'.join(re.escape(key) for key in sorted(mapping,key=len,reverse=True)))
+for name in ('stage_production_v46_source.py','stage_owner_v46.py','verify_v46_staging_after_timeout.py',
+ 'v31r4_read_v46_staging.py','stop_owner_v45_for_production_v46.py','v31r4_read_v46_terminal.py',
+ 'v31r4_preflight_v46.py','admit_owner_v46.py','start_owner_v46.py','v31r4_runtime_status_v46.py',
+ 'read_v46_campaign_progress.py','v31r4_read_v46_decision.py','v31r4_capture_v46_hold.py',
+ 'stage_v46_native_fingerprint.py','v31r4_v46_staged_fingerprint.py'):
+    content=pattern.sub(lambda match:mapping[match[0]],(root/name).read_text())
+    target=pattern.sub(lambda match:mapping[match[0]],name)
+    compile(content,target,'exec')
+    with (root/target).open('xb') as stream:stream.write(content.encode())
+print(json.dumps({'pin':pin,'owner_sha256':owner_sha,'live_mutation':False}))

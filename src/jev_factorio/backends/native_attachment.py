@@ -806,7 +806,8 @@ def readback(client, *, receipt_path=None, connector_witness_path=None,
              checkpoint_binding=None,
              completed_craft=None, background_craft=None, output_commitments=None,
              allow_legacy_manual_cycle_repair=False,
-             allow_unqualified_connector_bridge=False):
+             allow_unqualified_connector_bridge=False,
+             completion_query=False):
     result = decode_native(client.send_command('/sc ' + PROBE))
     if background_craft is not None:
         from .native_current_attachment import is_current_direct_installation
@@ -925,14 +926,9 @@ def readback(client, *, receipt_path=None, connector_witness_path=None,
             raise RuntimeError('Unknown native installation profile requires reconciliation')
         from .native_current_attachment import is_supported_direct_installation
         supported_direct = is_supported_direct_installation(result)
-        if output_commitments is not None and not supported_direct:
-            raise RuntimeError('Paid output attachment requires a supported direct installation')
-        if (result['modules']['connector_ownership'] and not supported_direct
-                and not (profile == LEGACY_MANUAL_CYCLE_PROFILE
-                         and allow_legacy_manual_cycle_repair)
-                and (result['modules']['connector_observer_bridge_v1'] is not True
-                     or result['connector_observer_bridge_qualified'] is not True)):
-            raise RuntimeError('Connector ownership observer bridge requires reconciliation')
+        # Source-backed completion queries are deliberately separate from the
+        # ordinary observer path, but they still require the same exact
+        # installed-asset verification before any query command is built.
         for name, expected in native['assets'].items():
             source = _asset_source(name, profile)
             if profile in {LEGACY_OBSERVATION_PROFILE, EXPANDED_OBSERVATION_PROFILE,
@@ -945,6 +941,21 @@ def readback(client, *, receipt_path=None, connector_witness_path=None,
                 continue  # Exact e759 hash is pinned; retained closure is reused.
             if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
                 raise RuntimeError('Native Lua source differs from installed manifest')
+        if completion_query:
+            if not supported_direct:
+                raise RuntimeError('Completion query requires an exact source-bound direct profile')
+            # Completion uses a separate, non-mutating storage query. Do not
+            # route it through ordinary observer/settled-factory composition.
+            # The installed-source hashes above are still mandatory.
+            return result
+        if output_commitments is not None and not supported_direct:
+            raise RuntimeError('Paid output attachment requires a supported direct installation')
+        if (result['modules']['connector_ownership'] and not supported_direct
+                and not (profile == LEGACY_MANUAL_CYCLE_PROFILE
+                         and allow_legacy_manual_cycle_repair)
+                and (result['modules']['connector_observer_bridge_v1'] is not True
+                     or result['connector_observer_bridge_qualified'] is not True)):
+            raise RuntimeError('Connector ownership observer bridge requires reconciliation')
         if supported_direct:
             from .native_current_attachment import qualify_current_connector_snapshot
             return qualify_current_connector_snapshot(
