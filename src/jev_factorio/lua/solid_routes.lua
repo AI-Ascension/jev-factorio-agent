@@ -2,13 +2,198 @@
 local c, fair = storage.campaign, storage.fair
 assert(c and fair, "Solid routes require the existing campaign and fair actor")
 local r = storage.solid_routes
+
+-- Read current native counters without calling the campaign observer.  This
+-- helper is installed on both first attachment and reload of the same retained
+-- runtime so a pre-existing save does not need its owner tables migrated.
+local function completion_sample(owner)
+    local api=assert(owner.coal_api,"Solid read-only completion API unavailable")
+    local p,a=api.epoch()
+    local tick=game.tick
+    local result={schema=1,producer="solid_routes_readonly_completion_v1",
+        session_id=storage.jev_session_id,tick=tick,actor_index=p.index,
+        actor_unit=a.unit_number,surface_index=a.surface.index,force_index=a.force.index,
+        routes={},diagnostics={}}
+    assert(type(result.session_id)=="string" and #result.session_id>0
+        and type(owner.cells)=="table" and type(owner.offers)=="table"
+        and type(owner.intents)=="table" and type(owner.binding)=="string" and #owner.binding>0,
+        "Solid completion owner binding is unavailable")
+    local function integer(value)
+        return type(value)=="number" and value>=0 and value<=9007199254740991 and value%1==0
+    end
+    local function held(entity,item)
+        local stack=entity.held_stack
+        assert(stack and (not stack.valid_for_read or stack.name==item and stack.quality
+            and stack.quality.name=="normal"),"Foreign solid held item")
+        return stack.valid_for_read and stack.count or 0
+    end
+    local function pipe_count(cell)
+        local total=held(cell.parts.send.entity,cell.item)+held(cell.parts.receive.entity,cell.item)
+        local belts=0
+        for _,step in ipairs(cell.steps) do if step.part:find("^belt:") then belts=belts+1 end end
+        assert(belts>=1 and belts<=24,"Solid completion belt count is invalid")
+        for _,step in ipairs(cell.steps) do if step.part:find("^belt:") then
+            local entity=assert(cell.parts[step.part] and cell.parts[step.part].entity,
+                "Solid completion belt receipt is missing")
+            for lane=1,2 do
+                local line=entity.get_transport_line(lane)
+                for _,entry in pairs(line.get_contents()) do
+                    assert(entry.name==cell.item and entry.quality=="normal",
+                        "Foreign solid transport item")
+                end
+                total=total+line.get_item_count(cell.item)
+            end
+        end end
+        return total
+    end
+    local function per_craft(entity,item,kind)
+        local recipe=entity.get_recipe()
+        assert(recipe and recipe.products and #recipe.products==1,
+            "Unsupported solid completion recipe")
+        local product=recipe.products[1]
+        assert(product.type=="item" and product.name==item and product.amount==1
+            and (product.probability or 1)==1 and not product.amount_min and not product.amount_max
+            and entity.productivity_bonus==0,"Variable solid completion recipe")
+        local modules=entity.get_module_inventory()
+        assert(not modules or modules.is_empty(),"Solid completion modules are unsupported")
+        assert(integer(entity.products_finished),"Solid completion counter is invalid")
+        if kind=="output" then return 1 end
+        assert(kind=="input" and recipe.ingredients and #recipe.ingredients<=32,
+            "Unsupported solid completion input")
+        local required=nil
+        for _,ingredient in pairs(recipe.ingredients) do
+            assert(ingredient.type=="item" and integer(ingredient.amount) and ingredient.amount>0,
+                "Unsupported solid completion ingredient")
+            if ingredient.name==item then required=ingredient.amount end
+        end
+        assert(required,"Solid completion recipe does not consume routed item")
+        return required
+    end
+    local occupied={}
+    local intent_keys={}
+    for _,intent in ipairs(owner.intents) do
+        assert(#intent_keys<4,"Solid completion intent bound exceeded")
+        assert(type(intent)=="table" and type(intent.source)=="string"
+            and type(intent.target)=="string" and type(intent.item)=="string"
+            and type(intent.destination)=="string","Malformed solid intent")
+        local fields={intent.source,intent.target,intent.item,intent.destination};local encoded={}
+        for _,value in ipairs(fields) do encoded[#encoded+1]=#value..":"..value end
+        intent_keys[#intent_keys+1]=table.concat(encoded,"")
+    end
+    assert(table.concat(intent_keys,"\n")==owner.binding,
+        "Solid completion intents changed after source binding")
+    local function add_cell(id,cell,proposed)
+        assert(type(id)=="string" and #id>0 and type(cell)=="table" and cell.route==id,
+            "Malformed solid completion route")
+        local source,target=api.paid_geometry(cell)
+        local parts={}
+        for part,value in pairs(cell.parts or {}) do
+            assert(type(value)=="table")
+            parts[part]={role=value.role,unit_number=value.unit_number,
+                receipt=value.receipt,paid=value.paid}
+        end
+        local ready=false
+        local counters={ready=false}
+        if not proposed and not cell.fault and not cell.pending then
+            local ok,linked=pcall(api.topology,cell)
+            ready=ok and linked==true
+        end
+        if ready then
+            local source_kind=cell.source.inventory
+            local target_kind=cell.target.inventory
+            local available=api.stock(api.inventory(source,source_kind),cell.item,true)
+            local produced=0
+            if source_kind=="output" then
+                per_craft(source,cell.item,"output")
+                produced=source.products_finished
+            end
+            local target_stock=api.stock(api.inventory(target,target_kind),cell.item,false)
+            local consumed=0
+            if target_kind=="input" then
+                local per=per_craft(target,cell.item,"input")
+                local crafting=target.is_crafting()
+                assert(type(crafting)=="boolean","Solid crafting state is invalid")
+                consumed=(target.products_finished+(crafting and 1 or 0))*per
+            end
+            assert(integer(available) and integer(produced) and integer(target_stock)
+                and integer(consumed) and (cell.target.inventory=="fuel" or integer(cell.initial_pipe)),
+                "Solid completion counter is invalid")
+            counters={ready=true,tick=tick,available=available,produced=produced,
+                pipe=pipe_count(cell),target_stock=target_stock,consumed=consumed}
+            if cell.target.inventory~="fuel" then counters.initial_pipe=cell.initial_pipe end
+        end
+        result.routes[id]={route=id,layout=cell.layout,item=cell.item,
+            source_role=cell.source.role,source_unit=source.unit_number,
+            target_role=cell.target.role,target_unit=target.unit_number,
+            target_inventory=cell.target.inventory,parts=parts,proposed=proposed==true,
+            source_first_tick=cell.first_tick or false,counters=counters,
+            baseline_flow=cell.flow and {layout=cell.flow.layout,source_unit=cell.flow.source_unit,
+                target_unit=cell.flow.target_unit,method=cell.flow.method,first_tick=cell.flow.first_tick,
+                last_tick=cell.flow.last_tick,last_positive_tick=cell.flow.last_positive_tick,
+                positive_samples=cell.flow.positive_samples,sent=cell.flow.sent,
+                received=cell.flow.received,unattributed_loss=cell.flow.unattributed_loss} or {}}
+        if not proposed then
+            occupied[cell.source.role]=true;occupied[cell.target.role]=true
+        end
+    end
+    local count=0
+    for id,cell in pairs(owner.cells) do count=count+1;assert(count<=4);add_cell(id,cell,false) end
+    for id,cell in pairs(owner.offers) do
+        if not owner.cells[id] then count=count+1;assert(count<=4);add_cell(id,cell,true) end
+    end
+    local cached=owner.completion_diagnostics
+    local cached_valid=type(cached)=="table" and cached.schema==1
+        and cached.producer=="solid_routes_observer_v1"
+        and cached.session_id==result.session_id and integer(cached.tick) and cached.tick<=tick
+        and tick-cached.tick<=600 and cached.actor_index==p.index
+        and cached.actor_unit==a.unit_number and cached.surface_index==a.surface.index
+        and cached.force_index==a.force.index and cached.intent_binding==owner.binding
+        and type(cached.intents)=="table" and #cached.intents==#owner.intents
+        and type(cached.diagnostics)=="table" and #cached.diagnostics==#owner.intents
+    local used_cached=false
+    for index,intent in ipairs(owner.intents) do
+        local state,reason=nil,nil
+        if occupied[intent.source] or occupied[intent.target] then
+            state,reason="committed","paid_or_pending_route"
+        else
+            for id,offer in pairs(owner.offers) do
+                if not owner.cells[id] and offer.source.role==intent.source
+                    and offer.target.role==intent.target and offer.item==intent.item
+                    and offer.target.inventory==intent.destination and not offer.fault
+                    and not offer.pending then
+                    state,reason="proposed","ready_layout";break
+                end
+            end
+        end
+        if not state then
+            assert(cached_valid,"Unresolved solid intent lacks current or fresh diagnostic evidence")
+            local old_intent,old_diagnostic=cached.intents[index],cached.diagnostics[index]
+            local source=c.entities[intent.source];local target=c.entities[intent.target]
+            assert(type(old_intent)=="table" and old_intent.source==intent.source
+                and old_intent.target==intent.target and old_intent.item==intent.item
+                and old_intent.destination==intent.destination
+                and old_intent.source_unit==(source and source.valid and source.unit_number or false)
+                and old_intent.target_unit==(target and target.valid and target.unit_number or false)
+                and type(old_diagnostic)=="table" and old_diagnostic.intent_index==index,
+                "Solid diagnostic endpoint identity changed")
+            state,reason=old_diagnostic.state,old_diagnostic.reason;used_cached=true
+        end
+        result.diagnostics[index]={intent_index=index,state=state,reason=reason}
+    end
+    result.diagnostics_tick=used_cached and cached.tick or tick
+    result.diagnostics_source=used_cached and "retained_owner_completion_mixed_v1"
+        or "retained_owner_completion_v1"
+    return result
+end
 if r then
     assert(r.protocol == 1 and r.contract_family == "straight-solid-corridor-v1" and r.implementation_revision == 4
         and r.reservation_contract == "full-corridor-manhattan-v1" and c.observe == r.observer and c.transfer == r.transfer
         and c.configure == r.configure, "Solid route runtime requires reconciliation")
+    r.completion_sample=completion_sample
     return
 end
-r = {protocol=1, contract_family="straight-solid-corridor-v1", implementation_revision=4, reservation_contract="full-corridor-manhattan-v1", cells={}, offers={}, intents={}, serial=0}
+r = {protocol=1, contract_family="straight-solid-corridor-v1", implementation_revision=4, reservation_contract="full-corridor-manhattan-v1", cells={}, offers={}, intents={}, serial=0,
+    completion_diagnostics=nil}
 storage.solid_routes = r
 local vectors = {{x=0,y=-1},{x=1,y=0},{x=0,y=1},{x=-1,y=0}}
 local source_names = {["wooden-chest"]=true,["iron-chest"]=true,["steel-chest"]=true,
@@ -281,6 +466,11 @@ c.set_solid_intents=function(intents)
     end
     local binding=table.concat(keys,"\n")
     assert(not r.binding or r.binding==binding,"Solid route treatment is immutable")
+    -- A completion query may consume only a diagnostic projection produced
+    -- after this exact intent list was observed. Reconfiguration invalidates
+    -- even an identical cache so a caller cannot reuse a prior observation as
+    -- a fresh completion read.
+    r.completion_diagnostics=nil
     r.binding,r.intents=binding,detached
     return {configured=#intents}
 end
@@ -501,6 +691,26 @@ r.observer=function()
             pending=cell.pending and {part=cell.pending.part,receipt=cell.pending.receipt,phase=cell.pending.phase} or {}}
     end end
     assert(count(rows)<=4,"Solid route cardinality exceeded")
+    -- Keep a private copy of the actual ordered producer diagnostics. The
+    -- completion reader validates this observation's identity and freshness;
+    -- it must never survey endpoints or synthesize a missing reason itself.
+    local diagnostic_intents={}
+    for index,intent in ipairs(r.intents) do
+        local source,target=c.entities[intent.source],c.entities[intent.target]
+        diagnostic_intents[index]={source=intent.source,target=intent.target,item=intent.item,
+            destination=intent.destination,
+            source_unit=source and source.valid and source.unit_number or false,
+            target_unit=target and target.valid and target.unit_number or false}
+    end
+    local retained_diagnostics={}
+    for index,diagnostic in ipairs(diagnostics) do
+        retained_diagnostics[index]={intent_index=diagnostic.intent_index,
+            state=diagnostic.state,reason=diagnostic.reason}
+    end
+    r.completion_diagnostics={schema=1,producer="solid_routes_observer_v1",
+        session_id=storage.jev_session_id,tick=game.tick,actor_index=p.index,
+        actor_unit=a.unit_number,surface_index=a.surface.index,force_index=a.force.index,
+        intent_binding=r.binding,intents=diagnostic_intents,diagnostics=retained_diagnostics}
     result.solid_routes={protocol=1,session_id=storage.jev_session_id,tick=game.tick,
         actor_index=p.index,surface_index=a.surface.index,force_index=a.force.index,routes=rows,diagnostics=diagnostics}
     if r.coal then result.coal_supply=r.coal.snapshot() end
@@ -536,3 +746,4 @@ c.observe,c.transfer,c.configure=r.observer,r.transfer,r.configure
 r.coal_api={endpoint=endpoint,endpoint_ok=endpoint_ok,owner=owner,epoch=epoch,stock=stock,
     inventory=inventory,clear=clear,topology=topology,paid_geometry=paid_geometry,remaining=remaining,
     powered_position=powered_position,reply=reply,inside=inside}
+r.completion_sample=completion_sample
