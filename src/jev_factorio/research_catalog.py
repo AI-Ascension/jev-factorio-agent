@@ -142,8 +142,7 @@ def parse(data: Any) -> dict:
             "prerequisites": _names(tech.get("prerequisites", [])),
             "packs": packs,
             "count": _count(tech.get("count")),
-            "infinite": isinstance(tech.get("count_formula"), str) or (
-                type(tech.get("max_level")) is int and tech["max_level"] >= 2 ** 31),
+            "infinite": type(tech.get("max_level")) is int and tech["max_level"] == 2 ** 32 - 1,
             "trigger": trigger,
             "unlocks": _names(tech.get("unlocks", []), 512),
             "locations": _names(tech.get("locations", []), 64),
@@ -152,7 +151,12 @@ def parse(data: Any) -> dict:
             "essential": tech.get("essential") is True,
         }
     science_packs = {}
-    for pack, row in (data.get("science_packs") or {}).items():
+    raw_packs = data.get("science_packs")
+    if raw_packs is None:
+        raw_packs = {}
+    if not isinstance(raw_packs, dict):
+        raise ValueError("Invalid science pack table")
+    for pack, row in raw_packs.items():
         if NAME.match(pack) and isinstance(row, dict):
             science_packs[pack] = {"from_start": row.get("from_start") is True,
                                    "unlocked_by": [t for t in _names(row.get("unlocked_by", [])) if t in technologies]}
@@ -289,7 +293,7 @@ class Tree:
         return pack_title(packs[0]) if packs else title(locations[0]) if locations else title(name)
 
     def summary(self, researched: set[str], current: str | None, progress: float | None,
-                seen: dict[str, int | None]) -> dict:
+                seen: dict[str, int | None], *, allow_trigger: bool = True) -> dict:
         tiers = []
         for pack in self.packs:
             members = [t for t in self.path if self._tier[t] == self.rank[pack]]
@@ -306,6 +310,11 @@ class Tree:
             row["tick"] = seen.get(row["key"]) if done and not row.get("start") else None
             milestones.append(row)
         now = None
+        if current is None and allow_trigger:
+            triggers = [name for name in available if self.techs[name]["trigger"] is not None]
+            if triggers:
+                current = min(triggers, key=lambda name: (self._depth[name], name))
+                progress = None  # Eligibility does not establish trigger progress.
         if current in self.techs:
             tech = self.techs[current]
             pack = self.packs[self._tier[current]] if self.packs else None
@@ -339,8 +348,8 @@ def main(argv: list[str] | None = None) -> int:
     password = os.environ.get("JEV_RCON_PASSWORD")
     if password is None:
         parser.error("Set JEV_RCON_PASSWORD (not accepted on the command line)")
-    if args.watch is not None and args.watch < 2:
-        parser.error("--watch must be at least 2 seconds")
+    if args.watch is not None and (not math.isfinite(args.watch) or args.watch < 2):
+        parser.error("--watch must be finite and at least 2 seconds")
     from factorio_rcon import RCONClient
 
     client = RCONClient(args.host, args.port, password)
