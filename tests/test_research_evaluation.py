@@ -560,9 +560,9 @@ def test_duckdb_views_round_trip(tmp_path, monkeypatch):
     monkeypatch.chdir(output)
     with duckdb.connect() as db:
         db.execute((output / "views.sql").read_text())
-        assert db.sql('SELECT verified_actions FROM runs').fetchone() == (1,)
-        assert db.sql('SELECT count(*) FROM interventions').fetchone() == (0,)
-        assert db.sql('SELECT input_tokens FROM model_calls').fetchone() == (10,)
+        assert db.execute('SELECT verified_actions FROM runs').fetchone() == (1,)
+        assert db.execute('SELECT count(*) FROM interventions').fetchone() == (0,)
+        assert db.execute('SELECT input_tokens FROM model_calls').fetchone() == (10,)
 
 
 def test_cli_report_and_nonzero_failure(tmp_path, capsys):
