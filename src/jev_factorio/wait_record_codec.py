@@ -365,6 +365,11 @@ class Encoder:
         self.rows_since_anchor = 0
         self.bytes_since_anchor = 0
 
+    def reset(self) -> None:
+        """Discard references when the full source row was not written."""
+        self.anchor = self.anchor_hash = self.scope = None
+        self.rows_since_anchor = self.bytes_since_anchor = 0
+
     def prepare(self, row: dict, *, wait: bool, anchor_candidate: bool = True) -> PreparedRecord:
         if type(row) is not dict or MARKER in row:
             raise ValueError("Wait records must be ordinary JSON objects")
